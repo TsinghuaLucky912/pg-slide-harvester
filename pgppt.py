@@ -143,6 +143,10 @@ def utcnow() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
+def today_date() -> str:
+    return dt.date.today().isoformat()
+
+
 def parse_time(value: str | None) -> dt.datetime | None:
     if not value:
         return None
@@ -204,6 +208,57 @@ def normalized_asset_url(url: str) -> str:
     return url
 
 
+def official_postgresql_event_url(url: str | None) -> bool:
+    parsed = urlparse(url or "")
+    return parsed.netloc in {"www.postgresql.org", "postgresql.org"} and parsed.path.startswith("/about/event/")
+
+
+def shallow_page_url(url: str | None) -> bool:
+    parsed = urlparse(url or "")
+    path = parsed.path.strip("/")
+    if not path:
+        return True
+    if re.fullmatch(r"(?:20\d{2}/?)?", path):
+        return True
+    return len([part for part in path.split("/") if part]) <= 2
+
+
+def better_event_url(existing: str | None, incoming: str | None) -> str | None:
+    if not incoming:
+        return existing
+    if not existing:
+        return incoming
+    if non_content_event_link(existing) and not non_content_event_link(incoming):
+        return incoming
+    if official_postgresql_event_url(existing):
+        return incoming
+    if shallow_page_url(existing) and not shallow_page_url(incoming):
+        return existing
+    if not shallow_page_url(existing) and shallow_page_url(incoming):
+        return incoming
+    return existing
+
+
+def non_content_event_link(url: str, label: str = "") -> bool:
+    text = f"{unquote(url)} {label}".lower()
+    blocked = (
+        "code-of-conduct",
+        "code-conduct",
+        "conduct",
+        "cfp",
+        "call-for-paper",
+        "call-for-presentation",
+        "sponsor",
+        "sponsorship",
+        "register",
+        "registration",
+        "ticket",
+        "venue",
+        "hotel",
+    )
+    return any(token in text for token in blocked)
+
+
 def asset_title_from_context(base_title: str, label: str, asset_url: str, asset_count: int) -> str:
     base = readable_text(base_title) or infer_session_title(asset_url)
     base_lower = base.lower()
@@ -253,6 +308,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             name text not null,
             slug text not null unique,
             year integer,
+            start_date text,
+            end_date text,
             source_url text,
             website_url text,
             status text not null default 'discovered',
@@ -346,6 +403,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    ensure_column(conn, "events", "start_date", "text")
+    ensure_column(conn, "events", "end_date", "text")
     ensure_column(conn, "run_assets", "source_url", "text")
     ensure_column(conn, "run_sessions", "source_url", "text")
     conn.execute(
@@ -468,21 +527,30 @@ def upsert_event(
     name: str,
     source_url: str | None = None,
     website_url: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> int:
     now = utcnow()
     slug = slugify(name)
     year_match = re.search(r"(20\d{2})", name)
-    year = int(year_match.group(1)) if year_match else None
+    year = int(start_date[:4]) if start_date else int(year_match.group(1)) if year_match else None
+    existing = conn.execute("select source_url, website_url from events where slug = ?", (slug,)).fetchone()
+    if existing:
+        source_url = better_event_url(existing["source_url"], source_url)
+        website_url = better_event_url(existing["website_url"], website_url)
     conn.execute(
         """
-        insert into events(name, slug, year, source_url, website_url, created_at, updated_at)
-        values(?, ?, ?, ?, ?, ?, ?)
+        insert into events(name, slug, year, start_date, end_date, source_url, website_url, created_at, updated_at)
+        values(?, ?, ?, ?, ?, ?, ?, ?, ?)
         on conflict(slug) do update set
+            year = coalesce(excluded.year, events.year),
+            start_date = coalesce(excluded.start_date, events.start_date),
+            end_date = coalesce(excluded.end_date, events.end_date),
             source_url = coalesce(excluded.source_url, events.source_url),
             website_url = coalesce(excluded.website_url, events.website_url),
             updated_at = excluded.updated_at
         """,
-        (name, slug, year, source_url, website_url, now, now),
+        (name, slug, year, start_date, end_date, source_url, website_url, now, now),
     )
     row = conn.execute("select id from events where slug = ?", (slug,)).fetchone()
     conn.commit()
@@ -622,6 +690,7 @@ def curl_fallback_response(url: str, timeout: int, headers: dict[str, str]):
         cmd = [
             "curl",
             "-L",
+            "--http1.1",
             "--silent",
             "--show-error",
             "--max-time",
@@ -688,7 +757,12 @@ def open_with_wall_timeout(req: Request, timeout: int):
         socket.setdefaulttimeout(old_socket_timeout)
 
 
-def request_url(url: str, timeout: int | None = None, retries: int | None = None):
+def request_url(
+    url: str,
+    timeout: int | None = None,
+    retries: int | None = None,
+    prefer_curl: bool = False,
+):
     timeout = timeout if timeout is not None else configured_positive_int("PGSH_REQUEST_TIMEOUT", 15)
     retries = retries if retries is not None else configured_positive_int("PGSH_REQUEST_RETRIES", 2)
     sources = load_json(SOURCES_PATH, {})
@@ -696,11 +770,12 @@ def request_url(url: str, timeout: int | None = None, retries: int | None = None
     parsed = urlparse(url)
     safe_path = quote(parsed.path, safe="/%:@&=+$,;~")
     safe_url = parsed._replace(path=safe_path).geturl()
-    if parsed.netloc.lower().endswith("posetteconf.com"):
+    preferred_curl_error = None
+    if prefer_curl or parsed.netloc.lower().endswith("posetteconf.com"):
         try:
             return curl_fallback_response(safe_url, timeout, headers)
-        except URLError:
-            pass
+        except URLError as exc:
+            preferred_curl_error = exc
     last_error = None
     for attempt in range(retries):
         req = Request(safe_url, headers=headers)
@@ -711,6 +786,8 @@ def request_url(url: str, timeout: int | None = None, retries: int | None = None
             if attempt + 1 < retries:
                 time.sleep(1)
     if last_error:
+        if preferred_curl_error:
+            last_error = URLError(f"curl failed: {preferred_curl_error}; urllib failed: {last_error}")
         try:
             return curl_fallback_response(safe_url, timeout, headers)
         except URLError:
@@ -869,6 +946,11 @@ def generic_title(value: str) -> bool:
     return normalized in GENERIC_ASSET_LABELS or title_has_noise(normalized) or title_has_url_noise(normalized)
 
 
+def error_page_title(value: str) -> bool:
+    normalized = readable_text(value).lower()
+    return normalized in {"404", "404 not found", "not found", "page not found"} or normalized.startswith("404 ")
+
+
 def preferred_asset_stem(local_path: str, file_url: str, session_title: str) -> str:
     local_stem = safe_filename_stem(Path(local_path or "").stem, fallback="")
     inferred = safe_filename_stem(infer_session_title(file_url or ""), fallback="")
@@ -946,7 +1028,8 @@ def download_asset(
             conn.commit()
 
     try:
-        with request_url(url) as resp:
+        download_timeout = configured_positive_int("PGSH_DOWNLOAD_TIMEOUT", 90)
+        with request_url(url, timeout=download_timeout, retries=1, prefer_curl=True) as resp:
             content_type = resp.headers.get("Content-Type", "")
             ext = guess_extension(url, content_type)
             if ext.lower() not in ASSET_EXTENSIONS and "pdf" not in content_type.lower():
@@ -1241,8 +1324,13 @@ def parse_html_page(page_url: str, text: str) -> dict[str, object]:
     return {"links": parser.links, "title": parser.title, "abstract": abstract}
 
 
-def extract_page_info(page_url: str) -> dict[str, object]:
-    with request_url(page_url) as resp:
+def extract_page_info(
+    page_url: str,
+    timeout: int | None = None,
+    retries: int | None = None,
+    prefer_curl: bool = False,
+) -> dict[str, object]:
+    with request_url(page_url, timeout=timeout, retries=retries, prefer_curl=prefer_curl) as resp:
         content = resp.read()
     text = content.decode("utf-8", errors="replace")
     return parse_html_page(page_url, text)
@@ -1253,15 +1341,89 @@ def extract_asset_links(page_url: str) -> list[tuple[str, str]]:
     return [(url, label) for url, label in info["links"] if is_asset_url(url)]
 
 
-def extract_links(page_url: str) -> list[tuple[str, str]]:
-    info = extract_page_info(page_url)
+def extract_links(
+    page_url: str,
+    timeout: int | None = None,
+    retries: int | None = None,
+    prefer_curl: bool = False,
+) -> list[tuple[str, str]]:
+    info = extract_page_info(page_url, timeout=timeout, retries=retries, prefer_curl=prefer_curl)
     return list(info["links"])
 
 
-def read_url_text(url: str) -> str:
-    with request_url(url) as resp:
+def read_url_text(
+    url: str,
+    timeout: int | None = None,
+    retries: int | None = None,
+    prefer_curl: bool = False,
+) -> str:
+    with request_url(url, timeout=timeout, retries=retries, prefer_curl=prefer_curl) as resp:
         content = resp.read()
     return content.decode("utf-8", errors="replace")
+
+
+def strip_html(value: str) -> str:
+    return readable_text(re.sub(r"<[^>]+>", " ", value or ""))
+
+
+def parse_official_event_date(value: str) -> tuple[str | None, str | None]:
+    dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", html.unescape(value or ""))
+    if not dates:
+        return None, None
+    return dates[0], dates[-1]
+
+
+def official_event_entries(source_url: str) -> list[dict[str, str | None]]:
+    text = read_url_text(source_url)
+    chunks = re.split(r'<hr\b[^>]*class=["\'][^"\']*eventseparator[^"\']*["\'][^>]*>', text, flags=re.I)
+    entries: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    link_pattern = re.compile(
+        r'<a\b[^>]*href=["\'](?P<href>/about/event/[^"\']+)["\'][^>]*>(?P<label>.*?)</a>',
+        flags=re.I | re.S,
+    )
+    date_pattern = re.compile(
+        r"Date:\s*(?P<date>.*?)(?:</div>|<div\b|</p>|<p\b)",
+        flags=re.I | re.S,
+    )
+    for chunk in chunks:
+        match = link_pattern.search(chunk)
+        if not match:
+            continue
+        url = urljoin(source_url, html.unescape(match.group("href")))
+        if url in seen:
+            continue
+        seen.add(url)
+        label = strip_html(match.group("label"))
+        date_match = date_pattern.search(chunk)
+        start_date, end_date = parse_official_event_date(date_match.group("date") if date_match else "")
+        entries.append(
+            {
+                "name": label or infer_session_title(url),
+                "url": url,
+                "start_date": start_date,
+                "end_date": end_date,
+            }
+        )
+    if entries:
+        return entries
+
+    for url, label in extract_links(source_url):
+        parsed = urlparse(url)
+        if parsed.netloc not in {"www.postgresql.org", "postgresql.org"}:
+            continue
+        if not parsed.path.startswith("/about/event/") or url in seen:
+            continue
+        seen.add(url)
+        entries.append(
+            {
+                "name": readable_text(label) or infer_session_title(url),
+                "url": url,
+                "start_date": None,
+                "end_date": None,
+            }
+        )
+    return entries
 
 
 def discover_pgevents_sessions(sessions_url: str) -> list[tuple[str, str]]:
@@ -1269,7 +1431,7 @@ def discover_pgevents_sessions(sessions_url: str) -> list[tuple[str, str]]:
     parsed_source = urlparse(sessions_url)
     path_parts = [part for part in parsed_source.path.split("/") if part]
     event_slug = path_parts[path_parts.index("events") + 1] if "events" in path_parts and path_parts.index("events") + 1 < len(path_parts) else ""
-    links = extract_links(sessions_url)
+    links = extract_links(sessions_url, timeout=8, retries=1, prefer_curl=True)
     seen: set[str] = set()
     sessions: list[tuple[str, str]] = []
     for url, label in links:
@@ -1390,7 +1552,7 @@ def wordpress_pages_api_url(site_url: str) -> str:
 
 def discover_wordpress_pages(site_url: str) -> list[dict[str, str]]:
     api_url = wordpress_pages_api_url(site_url)
-    with request_url(api_url) as resp:
+    with request_url(api_url, timeout=8, retries=1, prefer_curl=True) as resp:
         payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     pages: list[dict[str, str]] = []
     if not isinstance(payload, list):
@@ -1599,6 +1761,8 @@ def crawl_wordpress(
 
 
 def link_looks_relevant(url: str, label: str = "") -> bool:
+    if non_content_event_link(url, label):
+        return False
     text = f"{unquote(url)} {label}".lower()
     return any(keyword in text for keyword in DISCOVERY_PAGE_KEYWORDS) or is_probably_slide_asset(url, label)
 
@@ -1629,7 +1793,8 @@ def crawl_generic_site(
     root = f"{parsed_site.scheme}://{parsed_site.netloc}"
     queue = [site_url]
     seen: set[str] = set()
-    pages: list[tuple[str, str]] = []
+    pages: list[tuple[str, str, dict[str, object] | None]] = []
+    generic_timeout = configured_positive_int("PGSH_GENERIC_TIMEOUT", 5)
 
     while queue and len(pages) < max_pages:
         page_url = queue.pop(0)
@@ -1637,11 +1802,13 @@ def crawl_generic_site(
             continue
         seen.add(page_url)
         try:
-            links = extract_links(page_url)
-        except Exception:
+            page_info = extract_page_info(page_url, timeout=generic_timeout, retries=1, prefer_curl=True)
+            links = list(page_info["links"])
+        except Exception as exc:  # noqa: BLE001
+            pages.append((page_url, f"unreachable: {exc}", None))
             continue
-        label = infer_session_title(page_url)
-        pages.append((page_url, label))
+        label = str(page_info["title"] or infer_session_title(page_url))
+        pages.append((page_url, label, page_info))
         for url, link_label in links:
             parsed = urlparse(url)
             normalized = parsed._replace(fragment="").geturl()
@@ -1662,15 +1829,21 @@ def crawl_generic_site(
     failed = 0
     candidate_pages = 0
 
-    for page_url, title in pages:
+    for page_url, title, cached_page_info in pages:
+        if title.startswith("unreachable: "):
+            failed += 1
+            messages.append(f"ERROR {page_url}: {title}")
+            continue
         try:
-            page_info = extract_page_info(page_url)
+            page_info = cached_page_info or extract_page_info(page_url, timeout=generic_timeout, retries=1, prefer_curl=True)
             links = list(page_info["links"])
         except Exception as exc:  # noqa: BLE001
             failed += 1
             messages.append(f"ERROR {title}: page scan failed: {exc}")
             continue
         title = str(page_info["title"] or title)
+        if error_page_title(title):
+            continue
         assets = [(url, label) for url, label in links if is_probably_slide_asset(url, label)]
         candidate = link_looks_relevant(page_url, title) or bool(assets)
         if not candidate:
@@ -1730,7 +1903,7 @@ def crawl_pgevents(
     for session_url, title in discovered:
         session_id = upsert_session(conn, event_id, title, session_url=session_url, asset_status="missing")
         try:
-            page_info = extract_page_info(session_url)
+            page_info = extract_page_info(session_url, timeout=8, retries=1, prefer_curl=True)
             assets = [(url, label) for url, label in page_info["links"] if is_asset_url(url)]
             if page_info["abstract"]:
                 upsert_session(
@@ -1782,7 +1955,7 @@ def crawl_pgevents(
 def discover_postgresql_eu_sessions(schedule_url: str) -> list[tuple[str, str]]:
     """Return (session_url, title) pairs from a PostgreSQL Europe schedule page."""
     parsed_schedule = urlparse(schedule_url)
-    links = extract_links(schedule_url)
+    links = extract_links(schedule_url, timeout=8, retries=1, prefer_curl=True)
     seen: set[str] = set()
     sessions: list[tuple[str, str]] = []
     for url, label in links:
@@ -1829,7 +2002,7 @@ def crawl_postgresql_eu(
     for session_url, title in discovered:
         session_id = upsert_session(conn, event_id, title, session_url=session_url, asset_status="missing")
         try:
-            page_info = extract_page_info(session_url)
+            page_info = extract_page_info(session_url, timeout=8, retries=1, prefer_curl=True)
             if page_info["abstract"]:
                 session_id = upsert_session(
                     conn,
@@ -1878,19 +2051,28 @@ def crawl_postgresql_eu(
     return messages
 
 
-def eventyay_event_url(url: str) -> str | None:
+def eventyay_event_url(url: str, seen: set[str] | None = None, depth: int = 0) -> str | None:
+    if depth > 3:
+        return None
+    seen = seen or set()
+    normalized_url = urlparse(url)._replace(fragment="").geturl()
+    if normalized_url in seen:
+        return None
+    seen.add(normalized_url)
     parsed = urlparse(url)
     host = parsed.netloc.lower()
     if host == "eventyay.com":
         match = re.match(r"^/(?:e|ev)/([^/]+)/?", parsed.path)
         if match:
             return f"{parsed.scheme}://{parsed.netloc}/ev/{match.group(1)}/"
+    if host != "eventyay.com" and not host.endswith("summit.fossasia.org"):
+        return None
 
     try:
         probe_url = url
         if host.endswith("summit.fossasia.org") and "pgday-sponsorship" in parsed.path:
             probe_url = f"{parsed.scheme}://{parsed.netloc}/"
-        text = read_url_text(probe_url)
+        text = read_url_text(probe_url, timeout=5, retries=1, prefer_curl=True)
     except Exception:  # noqa: BLE001
         return None
 
@@ -1899,12 +2081,12 @@ def eventyay_event_url(url: str) -> str | None:
         refreshed = urljoin(probe_url, html.unescape(refresh_match.group(1)).strip())
         parsed_refreshed = urlparse(refreshed)
         if parsed_refreshed.netloc.lower() == "eventyay.com":
-            return eventyay_event_url(refreshed)
+            return eventyay_event_url(refreshed, seen, depth + 1)
 
     for link_url, _label in parse_html_page(probe_url, text)["links"]:
         parsed_link = urlparse(link_url)
         if parsed_link.netloc.lower() == "eventyay.com":
-            resolved = eventyay_event_url(link_url)
+            resolved = eventyay_event_url(link_url, seen, depth + 1)
             if resolved:
                 return resolved
     return None
@@ -2053,9 +2235,17 @@ def find_event(conn: sqlite3.Connection, event_query: str) -> tuple[sqlite3.Row 
         """
         select * from events
         where lower(name) like '%' || lower(?) || '%'
-        order by coalesce(year, 0) desc, name
+        order by
+            case
+                when coalesce(end_date, start_date) <= ? then 0
+                when start_date is not null then 1
+                else 2
+            end,
+            case when coalesce(end_date, start_date) <= ? then coalesce(end_date, start_date) end desc,
+            case when coalesce(end_date, start_date) > ? then start_date end asc,
+            name
         """,
-        (event_query,),
+        (event_query, today_date(), today_date(), today_date()),
     ).fetchall()
     if len(contains) == 1:
         return contains[0], contains
@@ -2064,7 +2254,7 @@ def find_event(conn: sqlite3.Connection, event_query: str) -> tuple[sqlite3.Row 
 
 def event_external_links(event_url: str) -> list[tuple[str, str]]:
     parsed_event = urlparse(event_url)
-    links = extract_links(event_url)
+    links = extract_links(event_url, timeout=10, retries=1, prefer_curl=True)
     candidates: list[tuple[str, str]] = []
     seen: set[str] = set()
     for url, label in links:
@@ -2074,10 +2264,13 @@ def event_external_links(event_url: str) -> list[tuple[str, str]]:
         if parsed.netloc in {parsed_event.netloc, "www.postgresql.org", "postgresql.org"}:
             continue
         normalized = parsed._replace(fragment="").geturl()
+        clean_label = re.sub(r"\s+", " ", label).strip()
+        if non_content_event_link(normalized, clean_label):
+            continue
         if normalized in seen:
             continue
         seen.add(normalized)
-        candidates.append((normalized, re.sub(r"\s+", " ", label).strip()))
+        candidates.append((normalized, clean_label))
     return candidates
 
 
@@ -2108,15 +2301,17 @@ def pgevents_sessions_url(url: str) -> str | None:
 def postgresql_eu_schedule_url(url: str) -> str | None:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
-    if host.endswith("postgresql.eu") or host.endswith("pgconf.eu"):
-        old_match = re.match(r"^/events/schedule/([^/]+)/?$", parsed.path)
-        if old_match:
-            return f"{parsed.scheme}://{parsed.netloc}/events/{old_match.group(1)}/schedule/"
-        if re.match(r"^/events/[^/]+/schedule/?$", parsed.path):
-            return parsed._replace(query="", fragment="").geturl()
+    if not (host.endswith("postgresql.eu") or host.endswith("pgconf.eu")):
+        return None
+
+    old_match = re.match(r"^/events/schedule/([^/]+)/?$", parsed.path)
+    if old_match:
+        return f"{parsed.scheme}://{parsed.netloc}/events/{old_match.group(1)}/schedule/"
+    if re.match(r"^/events/[^/]+/schedule/?$", parsed.path):
+        return parsed._replace(query="", fragment="").geturl()
 
     try:
-        for link_url, label in extract_links(url):
+        for link_url, label in extract_links(url, timeout=8, retries=1, prefer_curl=True):
             link = urlparse(link_url)
             link_host = link.netloc.lower()
             text = f"{link_url} {label}".lower()
@@ -2142,7 +2337,7 @@ def posette_schedule_url(url: str) -> str | None:
 
 def discover_posette_sessions(schedule_url: str) -> list[tuple[str, str]]:
     parsed_schedule = urlparse(schedule_url)
-    links = extract_links(schedule_url)
+    links = extract_links(schedule_url, timeout=8, retries=1, prefer_curl=True)
     seen: set[str] = set()
     sessions: list[tuple[str, str]] = []
     for url, label in links:
@@ -2190,7 +2385,7 @@ def crawl_posette(
     for session_url, title in discovered:
         session_id = upsert_session(conn, event_id, title, session_url=session_url, asset_status="missing")
         try:
-            page_info = extract_page_info(session_url)
+            page_info = extract_page_info(session_url, timeout=8, retries=1, prefer_curl=True)
             page_title = title
             session_id = upsert_session(
                 conn,
@@ -2303,12 +2498,22 @@ def adapter_summary(
     limit: int | None = None,
     probe_wordpress: bool = False,
 ) -> list[str]:
+    today = today_date()
     rows = conn.execute(
         """
         select name, website_url, source_url
         from events
-        order by coalesce(year, 0) desc, name
-        """
+        order by
+            case
+                when coalesce(end_date, start_date) <= ? then 0
+                when start_date is not null then 1
+                else 2
+            end,
+            case when coalesce(end_date, start_date) <= ? then coalesce(end_date, start_date) end desc,
+            case when coalesce(end_date, start_date) > ? then start_date end asc,
+            name
+        """,
+        (today, today, today),
     ).fetchall()
     if limit is not None:
         rows = rows[:limit]
@@ -2350,6 +2555,7 @@ def download_event_by_name(
     event_query: str,
     delay_seconds: float = 0.5,
     limit: int | None = None,
+    generic_max_pages: int | None = None,
 ) -> list[str]:
     event, matches = find_event(conn, event_query)
     if event is None:
@@ -2439,7 +2645,16 @@ def download_event_by_name(
             seen_targets.add(url)
             ran_adapter = True
             messages.append(f"adapter: generic ({label or url}) -> {url}")
-            messages.extend(crawl_generic_site(conn, url, event_name, delay_seconds, limit))
+            messages.extend(
+                crawl_generic_site(
+                    conn,
+                    url,
+                    event_name,
+                    delay_seconds,
+                    limit,
+                    generic_max_pages or 25,
+                )
+            )
             continue
 
     if ran_adapter:
@@ -2452,32 +2667,117 @@ def download_event_by_name(
     return messages
 
 
+def top_events(conn: sqlite3.Connection, count: int) -> list[sqlite3.Row]:
+    today = today_date()
+    return conn.execute(
+        """
+        select
+            e.*,
+            count(a.id) as asset_count,
+            sum(case when lower(a.file_type) = 'pdf' then 1 else 0 end) as pdf_count
+        from events e
+        left join sessions s on s.event_id = e.id
+        left join assets a on a.session_id = s.id
+        group by e.id
+        order by
+            case
+                when coalesce(e.end_date, e.start_date) <= ? then 0
+                when e.start_date is not null then 1
+                else 2
+            end,
+            case when coalesce(e.end_date, e.start_date) <= ? then coalesce(e.end_date, e.start_date) end desc,
+            case when coalesce(e.end_date, e.start_date) > ? then e.start_date end asc,
+            e.name
+        limit ?
+        """,
+        (today, today, today, count),
+    ).fetchall()
+
+
+def event_date_text(row: sqlite3.Row) -> str:
+    date_text = row["start_date"] or ""
+    if row["end_date"] and row["end_date"] != row["start_date"]:
+        date_text = f"{row['start_date'] or ''}..{row['end_date']}"
+    return date_text or "date=?"
+
+
+def download_top_events(
+    conn: sqlite3.Connection,
+    count: int,
+    delay_seconds: float = 0.5,
+    limit_per_event: int | None = None,
+    include_downloaded: bool = True,
+    dry_run: bool = False,
+    generic_max_pages: int = 5,
+) -> list[str]:
+    rows = top_events(conn, count)
+    messages = [f"top events: {len(rows)}" + (" (dry run)" if dry_run else "")]
+    processed = 0
+    skipped = 0
+    for index, row in enumerate(rows, 1):
+        asset_count = int(row["asset_count"] or 0)
+        pdf_count = int(row["pdf_count"] or 0)
+        prefix = f"#{index} {event_date_text(row)} | {row['name']}"
+        if asset_count and not include_downloaded:
+            skipped += 1
+            messages.append(f"SKIP {prefix} | already downloaded assets={asset_count}, PDFs={pdf_count}")
+            continue
+        processed += 1
+        if dry_run:
+            action = "WOULD RECHECK" if asset_count else "WOULD RUN"
+        else:
+            action = "RECHECK" if asset_count else "RUN"
+        messages.append(f"{action} {prefix} | existing assets={asset_count}, PDFs={pdf_count}")
+        if dry_run:
+            continue
+        try:
+            child_messages = download_event_by_name(
+                conn,
+                row["name"],
+                delay_seconds,
+                limit_per_event,
+                generic_max_pages=generic_max_pages,
+            )
+        except Exception as exc:  # noqa: BLE001
+            messages.append(f"  ERROR event failed: {exc}")
+            continue
+        messages.extend(f"  {line}" for line in child_messages)
+    messages.append(f"summary: processed={processed}, skipped_already_downloaded={skipped}")
+    return messages
+
+
 def discover_official_events(conn: sqlite3.Connection) -> list[str]:
     sources = load_json(SOURCES_PATH, {})
     messages: list[str] = []
     seen: set[str] = set()
     for source_url in sources.get("official_events", []):
         try:
-            links = extract_links(source_url)
+            entries = official_event_entries(source_url)
         except Exception as exc:  # noqa: BLE001
             messages.append(f"ERROR {source_url}: {exc}")
             continue
         count = 0
-        for url, label in links:
-            parsed = urlparse(url)
-            if parsed.netloc not in {"www.postgresql.org", "postgresql.org"}:
-                continue
-            if not parsed.path.startswith("/about/event/"):
-                continue
+        dated = 0
+        for entry in entries:
+            url = entry["url"] or ""
             if url in seen:
                 continue
             seen.add(url)
-            name = re.sub(r"\s+", " ", label).strip()
-            if not name or name.lower() in {"read more", "details"}:
-                name = infer_session_title(url)
-            upsert_event(conn, name, source_url=source_url, website_url=url)
+            name = readable_text(entry["name"]) or infer_session_title(url)
+            start_date = entry["start_date"]
+            end_date = entry["end_date"]
+            upsert_event(
+                conn,
+                name,
+                source_url=source_url,
+                website_url=url,
+                start_date=start_date,
+                end_date=end_date,
+            )
             count += 1
-        messages.append(f"OK {source_url}: discovered {count} event links")
+            if start_date:
+                dated += 1
+        messages.append(f"OK {source_url}: discovered {count} event links, dated {dated}")
     return messages
 
 
@@ -2610,6 +2910,7 @@ def report(conn: sqlite3.Connection) -> tuple[Path, Path]:
     report_dir.mkdir(parents=True, exist_ok=True)
     csv_path = report_dir / "index.csv"
     html_path = report_dir / "index.html"
+    today = today_date()
     rows = conn.execute(
         """
         select
@@ -2632,8 +2933,18 @@ def report(conn: sqlite3.Connection) -> tuple[Path, Path]:
         left join session_tags st on st.session_id = s.id
         left join tags t on t.id = st.tag_id
         group by s.id, a.id
-        order by e.year desc, e.name, s.title
-        """
+        order by
+            case
+                when coalesce(e.end_date, e.start_date) <= ? then 0
+                when e.start_date is not null then 1
+                else 2
+            end,
+            case when coalesce(e.end_date, e.start_date) <= ? then coalesce(e.end_date, e.start_date) end desc,
+            case when coalesce(e.end_date, e.start_date) > ? then e.start_date end asc,
+            e.name,
+            s.title
+        """,
+        (today, today, today),
     ).fetchall()
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -2914,14 +3225,32 @@ def finish_with_reports(
 
 def list_rows(conn: sqlite3.Connection, target: str) -> list[str]:
     if target == "events":
+        today = today_date()
         rows = conn.execute(
             """
-            select name, status, website_url, updated_at
+            select name, status, start_date, end_date, website_url, updated_at
             from events
-            order by coalesce(year, 0) desc, name
-            """
+            order by
+                case
+                    when coalesce(end_date, start_date) <= ? then 0
+                    when start_date is not null then 1
+                    else 2
+                end,
+                case when coalesce(end_date, start_date) <= ? then coalesce(end_date, start_date) end desc,
+                case when coalesce(end_date, start_date) > ? then start_date end asc,
+                name
+            """,
+            (today, today, today),
         ).fetchall()
-        return [f"{row['name']} | {row['status']} | {row['website_url'] or ''} | updated={row['updated_at']}" for row in rows]
+        lines = []
+        for row in rows:
+            date_text = row["start_date"] or ""
+            if row["end_date"] and row["end_date"] != row["start_date"]:
+                date_text = f"{row['start_date'] or ''}..{row['end_date']}"
+            lines.append(
+                f"{date_text or 'date=?'} | {row['name']} | {row['status']} | {row['website_url'] or ''} | updated={row['updated_at']}"
+            )
+        return lines
     if target == "assets":
         rows = conn.execute(
             """
@@ -2978,6 +3307,15 @@ def build_parser() -> argparse.ArgumentParser:
     download_event.add_argument("event_name")
     download_event.add_argument("--delay", type=float, default=0.5)
     download_event.add_argument("--limit", type=int)
+
+    download_top = sub.add_parser("download-top", help="download slides for the top N events in list events order")
+    download_top.add_argument("count", type=int)
+    download_top.add_argument("--delay", type=float, default=0.5)
+    download_top.add_argument("--limit-per-event", type=int)
+    download_top.add_argument("--missing-only", action="store_true", help="skip events that already have downloaded assets")
+    download_top.add_argument("--include-downloaded", action="store_true", help="deprecated; download-top re-checks downloaded events by default")
+    download_top.add_argument("--dry-run", action="store_true", help="show which events would be processed without downloading")
+    download_top.add_argument("--generic-max-pages", type=int, default=5, help="max pages to scan on generic websites per event")
 
     tick_parser = sub.add_parser("tick", help="check sessions whose next_check_at is due")
     tick_parser.add_argument("--limit", type=int, default=20)
@@ -3042,6 +3380,19 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         if args.command == "download-event":
             messages = download_event_by_name(conn, args.event_name, args.delay, args.limit)
+            finish_with_reports(conn, run_id, messages, include_run_report=True)
+            return 0
+
+        if args.command == "download-top":
+            messages = download_top_events(
+                conn,
+                args.count,
+                delay_seconds=args.delay,
+                limit_per_event=args.limit_per_event,
+                include_downloaded=(args.include_downloaded or not args.missing_only),
+                dry_run=args.dry_run,
+                generic_max_pages=args.generic_max_pages,
+            )
             finish_with_reports(conn, run_id, messages, include_run_report=True)
             return 0
 

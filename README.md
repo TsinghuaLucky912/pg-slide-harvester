@@ -135,6 +135,18 @@ python3 pgppt.py list events
 # Download slides by event name.
 python3 pgppt.py download-event "PGConf.dev 2026"
 
+# Download slides for the top N recent events. Existing files are skipped by URL/content.
+python3 pgppt.py download-top 20
+
+# Preview the same batch without downloading.
+python3 pgppt.py download-top 20 --dry-run
+
+# Only process events that do not already have any downloaded assets.
+python3 pgppt.py download-top 20 --missing-only
+
+# Keep a batch run shallow and fast when many events use generic websites.
+python3 pgppt.py download-top 20 --generic-max-pages 2 --limit-per-event 1
+
 # Download a single PDF/PPT/PPTX/ODP asset.
 python3 pgppt.py ingest <asset-url>
 
@@ -154,6 +166,10 @@ python3 pgppt.py organize-archive
 python3 pgppt.py list assets
 python3 pgppt.py list sessions
 ```
+
+`list events` is ordered by the official PostgreSQL event `Date`: recent completed
+or in-progress events first, then future events, then undated entries. This keeps
+the best candidates for newly published slide decks at the top.
 
 ### Reports
 
