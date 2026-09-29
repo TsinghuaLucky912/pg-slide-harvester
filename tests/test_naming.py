@@ -30,6 +30,16 @@ class FakeResponse(io.BytesIO):
 
 
 class NamingTests(unittest.TestCase):
+    def test_japanese_context_wins_over_shared_cjk_characters(self):
+        self.assertEqual(
+            pgppt.non_english_language_slug(["PostgreSQL 19 新機能概要 OSC Hokkaido 2026"]),
+            "japanese",
+        )
+        self.assertEqual(
+            pgppt.non_english_language_slug(["PostgreSQL 18で考えるUUID主キー"]),
+            "japanese",
+        )
+
     def test_safe_filename_stem_keeps_readable_title(self):
         self.assertEqual(
             pgppt.safe_filename_stem("Semi-Joins in Postgres: planner/optimizer?"),

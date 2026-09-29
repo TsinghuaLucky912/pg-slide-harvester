@@ -63,10 +63,15 @@ published, downloading files one by one, and renaming cryptic filenames by hand.
 
 Current adapters include:
 
+- PostgreSQL US event discovery and schedules (`postgresql.us`).
 - PostgreSQL Europe event discovery and schedules (`postgresql.eu` / `pgconf.eu`).
 - `pgevents.ca`, such as PGConf.dev.
 - Indico-based events, such as CERN PGDay.
 - WordPress-based conference websites.
+- PostgreSQL-related talks from DuckDB Library and MyDBOps webinars.
+- Publicly downloadable PostgreSQL decks from Speaker Deck search results.
+- Japan PostgreSQL User Group conference pages (`postgresql.jp`), including
+  direct PDFs and supported public deck pages.
 - A generic fallback crawler for independent event websites.
 
 PostgreSQL conference websites vary a lot, so the project grows adapter by
@@ -154,6 +159,18 @@ python3 pgppt.py ingest <asset-url>
 # Scan a single page for slide links.
 python3 pgppt.py ingest <page-url> --event "Event Name" --title "Session Title"
 
+# Crawl one PostgreSQL US schedule directly.
+python3 pgppt.py crawl-postgresql-us \
+  https://postgresql.us/events/pgconfus2025/schedule/ \
+  --event "PGConf NYC 2025"
+
+# Harvest PostgreSQL materials from publication/community sources.
+python3 pgppt.py harvest-source duckdb
+python3 pgppt.py harvest-source mydbops
+python3 pgppt.py harvest-source speakerdeck --max-pages 1
+python3 pgppt.py harvest-source jpug
+python3 pgppt.py harvest-source all --max-pages 1
+
 # Check sessions whose next check time is due.
 python3 pgppt.py tick
 
@@ -182,7 +199,8 @@ The project generates two kinds of reports:
 | Run report | `reports/runs/<date>/<event>-run-<id>.html`, `.csv` | One dated report for a single download run. Shows what that run downloaded or touched. |
 
 Run reports are created by download-oriented commands such as `download-event`,
-`ingest`, `crawl-pgevents`, `crawl-generic`, and `tick`.
+`ingest`, `crawl-pgevents`, `crawl-postgresql-us`, `harvest-source`,
+`crawl-generic`, and `tick`.
 
 Each run report includes the run command, date, action, message, event, session,
 tags, local file path, source URL, size, and timestamps. Actions include
@@ -271,7 +289,7 @@ python3 pgppt.py report
 ### Roadmap
 
 - Add more PostgreSQL conference platform adapters.
-- Improve PGConf.EU/PostgreSQL Europe support.
+- Add optional adapters for more public deck-hosting platforms.
 - Improve topic classification.
 - Add optional recurring job setup instructions.
 - Expand automated tests.
@@ -323,10 +341,15 @@ PostgreSQL 生态会议中的公开 PPT/PDF 资料。它会从 PostgreSQL 官方
 
 ### 当前支持的来源
 
+- PostgreSQL US 活动发现与日程页（`postgresql.us`）。
 - PostgreSQL Europe 活动发现与日程页（`postgresql.eu` / `pgconf.eu`）。
 - `pgevents.ca`，例如 PGConf.dev。
 - Indico 会议系统，例如 CERN PGDay。
 - WordPress 会议官网。
+- DuckDB Library 和 MyDBOps Webinars 中的 PostgreSQL 相关资料。
+- Speaker Deck 搜索结果中允许公开下载的 PostgreSQL 演示文稿。
+- 日本 PostgreSQL 用户会历届会议页（`postgresql.jp`），包括官网直链和
+  已支持的公开演示文稿页面。
 - 通用会议网站扫描器，用于尝试识别独立站点中的资料链接。
 
 不同 PostgreSQL 会议使用的网站系统差异很大，本项目采用逐步补 adapter 的
@@ -386,7 +409,7 @@ PGSH_HOME=/path/to/pg-slide-archive pgsh init
 # 初始化本地目录和 SQLite 状态
 python3 pgppt.py init
 
-# 从 PostgreSQL 官方活动页和 PostgreSQL Europe 发现会议
+# 从 PostgreSQL 官方、PostgreSQL Europe 和 PostgreSQL US 活动页发现会议
 python3 pgppt.py scan-official
 
 # 查看已发现会议
@@ -400,6 +423,18 @@ python3 pgppt.py ingest <asset-url>
 
 # 扫描单个页面中的资料链接
 python3 pgppt.py ingest <page-url> --event "Event Name" --title "Session Title"
+
+# 直接抓取 PostgreSQL US 会议日程
+python3 pgppt.py crawl-postgresql-us \
+  https://postgresql.us/events/pgconfus2025/schedule/ \
+  --event "PGConf NYC 2025"
+
+# 抓取资料库和社区来源
+python3 pgppt.py harvest-source duckdb
+python3 pgppt.py harvest-source mydbops
+python3 pgppt.py harvest-source speakerdeck --max-pages 1
+python3 pgppt.py harvest-source jpug
+python3 pgppt.py harvest-source all --max-pages 1
 
 # 检查到期的 session，适合定期运行
 python3 pgppt.py tick
@@ -513,7 +548,7 @@ python3 pgppt.py report
 ### 路线图
 
 - 支持更多 PostgreSQL 会议平台。
-- 增强 PGConf.EU/PostgreSQL Europe 等站点 adapter。
+- 为更多允许公开下载的演示文稿平台增加可选 adapter。
 - 改进主题分类质量。
 - 增加可选的定时任务安装说明。
 - 增加更完整的测试覆盖。

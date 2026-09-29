@@ -470,6 +470,302 @@ class AdapterTests(unittest.TestCase):
         finally:
             pgppt.discover_postgresql_eu_sessions = original_discover
 
+    def test_postgresql_us_event_entries_and_schedule_resolution(self):
+        original_request_url = pgppt.request_url
+        try:
+            pages = {
+                "https://postgresql.us/events/": b"""
+                    <dl class="eventlist">
+                      <dt><h4><a href="https://2026.postgressummit.us">Postgres Summit US 2026</a></h4></dt>
+                      <dd><span>2026-09-30 - 2026-10-02</span></dd>
+                    </dl>
+                """,
+                "https://2026.postgressummit.us": b"""
+                    <a href="https://postgresql.us/events/postgressummitus2026/schedule/">Schedule</a>
+                """,
+            }
+            pgppt.request_url = lambda url, **kwargs: FakeResponse(pages[url], "text/html")
+
+            entries = pgppt.postgresql_us_event_entries("https://postgresql.us/events/")
+
+            self.assertEqual(entries[0]["name"], "Postgres Summit US 2026")
+            self.assertEqual(entries[0]["start_date"], "2026-09-30")
+            self.assertEqual(entries[0]["end_date"], "2026-10-02")
+            self.assertEqual(
+                pgppt.postgresql_us_schedule_url("https://2026.postgressummit.us"),
+                "https://postgresql.us/events/postgressummitus2026/schedule/",
+            )
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_discover_postgresql_us_sessions_uses_talk_title(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <article class="session-2145 track-55 room-72">
+                  <div class="session-content">
+                    <h1><a href="session/2145-postgres-2025-in-review/">Postgres 2025 in Review</a></h1>
+                  </div>
+                  <a href="session/2145-postgres-2025-in-review/#slides">Slides available</a>
+                </article>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            sessions = pgppt.discover_postgresql_us_sessions(
+                "https://postgresql.us/events/pgconfus2025/schedule/"
+            )
+
+            self.assertEqual(sessions, [(
+                "https://postgresql.us/events/pgconfus2025/schedule/session/2145-postgres-2025-in-review/",
+                "Postgres 2025 in Review",
+            )])
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_schedule_adapter_counts_asset_download_errors_as_failed(self):
+        original_extract_page_info = pgppt.extract_page_info
+        original_download_asset = pgppt.download_asset
+        try:
+            pgppt.extract_page_info = lambda *args, **kwargs: {
+                "abstract": "",
+                "links": [("https://example.com/deck.pdf", "Slides")],
+            }
+            pgppt.download_asset = lambda *args, **kwargs: (False, "http error 429: Too Many Requests")
+            conn = memory_conn(self)
+            pgppt.init_db(conn)
+
+            messages = pgppt.crawl_schedule_adapter(
+                conn,
+                "https://postgresql.us/events/example/schedule/",
+                "Example Event",
+                0,
+                None,
+                "postgresql.us",
+                lambda url: [("https://postgresql.us/events/example/session/1/", "Example Talk")],
+            )
+
+            self.assertIn("ERROR Example Talk: http error 429: Too Many Requests", messages)
+            self.assertIn("summary: downloaded=0, skipped=0, missing=0, failed=1", messages)
+        finally:
+            pgppt.extract_page_info = original_extract_page_info
+            pgppt.download_asset = original_download_asset
+
+    def test_scan_official_includes_postgresql_us_sources(self):
+        original_load_json = pgppt.load_json
+        original_us_entries = pgppt.postgresql_us_event_entries
+        try:
+            pgppt.load_json = lambda path, default: {
+                "official_events": [],
+                "postgresql_eu_events": [],
+                "postgresql_us_events": ["https://postgresql.us/events/"],
+            }
+            pgppt.postgresql_us_event_entries = lambda url: [{
+                "name": "Postgres Summit US 2026",
+                "url": "https://2026.postgressummit.us",
+                "start_date": "2026-09-30",
+                "end_date": "2026-10-02",
+            }]
+            conn = memory_conn(self)
+            pgppt.init_db(conn)
+
+            messages = pgppt.discover_official_events(conn)
+
+            row = conn.execute(
+                "select website_url, start_date from events where name = ?",
+                ("Postgres Summit US 2026",),
+            ).fetchone()
+            self.assertEqual(row["website_url"], "https://2026.postgressummit.us")
+            self.assertEqual(row["start_date"], "2026-09-30")
+            self.assertIn(
+                "OK https://postgresql.us/events/: discovered 1 event links, dated 1",
+                messages,
+            )
+        finally:
+            pgppt.load_json = original_load_json
+            pgppt.postgresql_us_event_entries = original_us_entries
+
+    def test_discover_duckdb_library_filters_postgres_talks(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <div class="librarypreview postpreview talk" data-title="Building a Postgres Warehouse" data-source="thirdparty" data-category="community" data-type="talk">
+                  <a href="/library/postgres-warehouse/" title="Building a Postgres Warehouse" class="blocklink"></a>
+                </div>
+                <div class="librarypreview postpreview talk" data-title="DuckDB in Python" data-source="duckdb" data-category="core" data-type="talk">
+                  <a href="/library/python/" title="DuckDB in Python" class="blocklink"></a>
+                </div>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            entries = pgppt.discover_duckdb_library_entries("https://duckdb.org/library/")
+
+            self.assertEqual(entries, [{
+                "title": "Building a Postgres Warehouse",
+                "page_url": "https://duckdb.org/library/postgres-warehouse/",
+            }])
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_discover_mydbops_filters_postgresql_webinars(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <a href="/webinars/postgresql-ha" class="w-inline-block">
+                  <div class="webninar-head">PostgreSQL High Availability</div>
+                </a>
+                <a href="/webinars/mysql-ha" class="w-inline-block">
+                  <div class="webninar-head">MySQL High Availability</div>
+                </a>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            entries = pgppt.discover_mydbops_entries("https://www.mydbops.com/webinars")
+
+            self.assertEqual(entries, [{
+                "title": "PostgreSQL High Availability",
+                "page_url": "https://www.mydbops.com/webinars/postgresql-ha",
+            }])
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_discover_speakerdeck_entries_deduplicates_queries(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <a class="deck-preview-link" href="/alice/postgresql-19" title="PostgreSQL 19 Internals"></a>
+                <a class="deck-preview-link" href="/alice/mysql-9" title="MySQL 9 Internals"></a>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            entries = pgppt.discover_speakerdeck_entries([
+                "https://speakerdeck.com/search?q=postgresql+19",
+                "https://speakerdeck.com/search?q=postgresql",
+            ])
+
+            self.assertEqual(entries, [{
+                "title": "PostgreSQL 19 Internals",
+                "page_url": "https://speakerdeck.com/alice/postgresql-19",
+            }])
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_speakerdeck_assets_only_use_current_deck_download(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <meta name="description" content="PostgreSQL internals">
+                <a title="Download PDF" class="text-white" href="https://files.speakerdeck.com/presentations/current/deck.pdf">Download</a>
+                <p>Reference: <a href="https://example.com/other-talk.pdf">other talk</a></p>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            assets, abstract = pgppt.resource_page_assets("https://speakerdeck.com/alice/postgresql")
+
+            self.assertEqual(assets, [(
+                "https://files.speakerdeck.com/presentations/current/deck.pdf",
+                "Download PDF",
+            )])
+            self.assertEqual(abstract, "PostgreSQL internals")
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_resource_page_assets_rejects_ambiguous_pdf_collections(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <a href="/slides/first.pdf">First deck</a>
+                <a href="/slides/second.pdf">Second deck</a>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            assets, _ = pgppt.resource_page_assets("https://example.com/materials/")
+
+            self.assertEqual(assets, [])
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_resource_page_assets_matches_sra_document_to_event(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <div class="document_left"><a href="/slides/other.pdf">Other</a></div>
+                <div class="document_right"><a href="https://example.com/another-event">Another event</a></div>
+                <div class="eventline"></div>
+                <div class="document_left"><a href="/slides/jpug.pdf">JPUG deck</a></div>
+                <div class="document_right"><a href="https://www.postgresql.jp/jpug-pgcon2021">JPUG 2021</a></div>
+                <div class="eventline"></div>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            assets, _ = pgppt.resource_page_assets(
+                "https://www.sraoss.co.jp/event_seminar/material/2021/",
+                expected_event_url="https://www.postgresql.jp/jpug-pgcon2021",
+            )
+
+            self.assertEqual(assets, [("https://www.sraoss.co.jp/slides/jpug.pdf", "JPUG deck")])
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_failed_download_message_distinguishes_errors_from_skips(self):
+        self.assertTrue(pgppt.failed_download_message("http error 404: Not Found"))
+        self.assertTrue(pgppt.failed_download_message("url error: connection reset"))
+        self.assertTrue(pgppt.failed_download_message("invalid pdf header"))
+        self.assertFalse(pgppt.failed_download_message("already_exists: archive/deck.pdf"))
+        self.assertFalse(pgppt.failed_download_message("duplicate content: archive/deck.pdf"))
+
+    def test_discover_jpug_entries_keeps_direct_and_external_slides(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <table>
+                  <td><p><a href="#A1">A1</a><br>PostgreSQL Vacuum Internals</p>
+                    <a href="/files/vacuum.pdf">[\xe8\xac\x9b\xe6\xbc\x94\xe3\x82\xb9\xe3\x83\xa9\xe3\x82\xa4\xe3\x83\x89]</a></td>
+                  <td><p><a href="#A2">A2</a><br>PostgreSQL Replication</p>
+                    <a href="https://speakerdeck.com/alice/replication">[\xe8\xac\x9b\xe6\xbc\x94\xe3\x82\xb9\xe3\x83\xa9\xe3\x82\xa4\xe3\x83\x89]</a></td>
+                </table>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            entries = pgppt.discover_jpug_entries("https://www.postgresql.jp/jpug-pgcon2025")
+
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(entries[0]["assets"][0][0], "https://www.postgresql.jp/files/vacuum.pdf")
+            self.assertEqual(entries[1]["asset_pages"], ["https://speakerdeck.com/alice/replication"])
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_discover_jpug_entries_uses_agenda_link_when_title_is_not_in_paragraph(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <table><td>T3 <a href="#T3">SQL Tuning Basics</a>
+                  <p align="right"><a href="/files/tuning.pdf">[slides]</a></p>
+                </td></table>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            entries = pgppt.discover_jpug_entries("https://www.postgresql.jp/jpug-pgcon2018")
+
+            self.assertEqual(entries[0]["title"], "SQL Tuning Basics")
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_discover_jpug_entries_uses_paragraph_after_code_only_agenda_link(self):
+        original_request_url = pgppt.request_url
+        try:
+            page = b"""
+                <table><td><p><a href="#A2">A2</a><br>PostgreSQL Arrow Integration</p>
+                  <a href="/files/arrow.pdf">[slides]</a>
+                </td></table>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(page, "text/html")
+
+            entries = pgppt.discover_jpug_entries("https://www.postgresql.jp/jpug-pgcon2025")
+
+            self.assertEqual(entries[0]["title"], "PostgreSQL Arrow Integration")
+        finally:
+            pgppt.request_url = original_request_url
+
     def test_generic_crawl_skips_social_and_forms_hosts(self):
         self.assertFalse(pgppt.generic_crawl_allowed("https://www.linkedin.com/groups/14216001/"))
         self.assertFalse(pgppt.generic_crawl_allowed("https://bsky.app/profile/nordicpgday.org"))

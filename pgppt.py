@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -220,6 +220,8 @@ def event_listing_url(url: str | None) -> bool:
     if host in {"www.postgresql.org", "postgresql.org"}:
         return path in {"/about/events", "/about/eventarchive"}
     if host.endswith("postgresql.eu") or host.endswith("pgconf.eu"):
+        return path in {"/events", "/events/past"}
+    if host in {"postgresql.us", "www.postgresql.us"}:
         return path in {"/events", "/events/past"}
     return False
 
@@ -723,10 +725,20 @@ def curl_fallback_response(url: str, timeout: int, headers: dict[str, str]):
         header_blocks = [block for block in re.split(r"\r?\n\r?\n", header_text) if block.strip()]
         response_headers: dict[str, str] = {}
         if header_blocks:
-            for line in header_blocks[-1].splitlines()[1:]:
+            status_lines = header_blocks[-1].splitlines()
+            status_match = re.match(r"HTTP/\S+\s+(\d{3})(?:\s+(.*))?", status_lines[0])
+            for line in status_lines[1:]:
                 if ":" in line:
                     key, value = line.split(":", 1)
                     response_headers[key.strip()] = value.strip()
+            if status_match and int(status_match.group(1)) >= 400:
+                raise HTTPError(
+                    url,
+                    int(status_match.group(1)),
+                    status_match.group(2) or "HTTP error",
+                    response_headers,
+                    None,
+                )
         return BufferedResponse(body_path.read_bytes(), response_headers)
     except (OSError, subprocess.SubprocessError) as exc:
         raise URLError(f"curl fallback failed: {exc}") from exc
@@ -843,10 +855,12 @@ def non_english_language_slug(parts: Iterable[str]) -> str | None:
     lowered = text.lower()
     if not lowered:
         return None
-    if contains_range(text, ((0x4E00, 0x9FFF),)):
-        return "chinese"
     if contains_range(text, ((0x3040, 0x30FF),)):
         return "japanese"
+    if any(keyword in lowered for keyword in ("hokkaido", "osaka", "kyoto", "jpug", "postgresql conference japan")):
+        return "japanese"
+    if contains_range(text, ((0x4E00, 0x9FFF),)):
+        return "chinese"
     if contains_range(text, ((0xAC00, 0xD7AF),)):
         return "korean"
     if contains_range(text, ((0x0400, 0x04FF), (0x0500, 0x052F))):
@@ -1125,6 +1139,19 @@ def download_asset(
     record_run_asset(conn, existing_asset_id, "downloaded", str(dest.relative_to(ROOT)), source_url=url)
     conn.commit()
     return True, f"downloaded: {dest.relative_to(ROOT)}"
+
+
+def failed_download_message(message: str) -> bool:
+    lowered = message.lower()
+    return lowered.startswith(
+        (
+            "download failed:",
+            "http error ",
+            "invalid ",
+            "unexpected asset ",
+            "url error:",
+        )
+    )
 
 
 def compute_next_check(status: str, check_count: int) -> str:
@@ -1439,7 +1466,7 @@ def official_event_entries(source_url: str) -> list[dict[str, str | None]]:
     return entries
 
 
-def postgresql_eu_event_entries(source_url: str) -> list[dict[str, str | None]]:
+def eventlist_entries(source_url: str) -> list[dict[str, str | None]]:
     text = read_url_text(source_url, timeout=12, retries=1, prefer_curl=True)
     event_lists = re.findall(
         r'<dl\b[^>]*class=["\'][^"\']*\beventlist\b[^"\']*["\'][^>]*>(.*?)</dl>',
@@ -1471,6 +1498,14 @@ def postgresql_eu_event_entries(source_url: str) -> list[dict[str, str | None]]:
                 }
             )
     return entries
+
+
+def postgresql_eu_event_entries(source_url: str) -> list[dict[str, str | None]]:
+    return eventlist_entries(source_url)
+
+
+def postgresql_us_event_entries(source_url: str) -> list[dict[str, str | None]]:
+    return eventlist_entries(source_url)
 
 
 def discover_pgevents_sessions(sessions_url: str) -> list[tuple[str, str]]:
@@ -1580,6 +1615,9 @@ def crawl_indico(
             if ok:
                 downloaded += 1
                 messages.append(f"OK {title}: {msg}")
+            elif failed_download_message(msg):
+                failed += 1
+                messages.append(f"ERROR {title}: {msg}")
             else:
                 skipped += 1
                 messages.append(f"SKIP {title}: {msg}")
@@ -2052,6 +2090,9 @@ def crawl_generic_site(
             if ok:
                 downloaded += 1
                 messages.append(f"OK {title}: {msg}")
+            elif failed_download_message(msg):
+                failed += 1
+                messages.append(f"ERROR {title}: {msg}")
             else:
                 skipped += 1
                 messages.append(f"SKIP {title}: {msg}")
@@ -2124,6 +2165,9 @@ def crawl_pgevents(
             if ok:
                 downloaded += 1
                 messages.append(f"OK {title}: {msg}")
+            elif failed_download_message(msg):
+                failed += 1
+                messages.append(f"ERROR {title}: {msg}")
             else:
                 skipped += 1
                 messages.append(f"SKIP {title}: {msg}")
@@ -2187,27 +2231,58 @@ def discover_postgresql_eu_sessions(schedule_url: str) -> list[tuple[str, str]]:
     return sessions
 
 
-def crawl_postgresql_eu(
+def discover_postgresql_us_sessions(schedule_url: str) -> list[tuple[str, str]]:
+    """Return session URLs and titles from a PgUS conference schedule."""
+    text = read_url_text(schedule_url, timeout=12, retries=1, prefer_curl=True)
+    article_pattern = re.compile(
+        r'<article\b[^>]*class=["\'][^"\']*\bsession-\d+\b[^"\']*["\'][^>]*>'
+        r'(?P<body>.*?)</article>',
+        flags=re.I | re.S,
+    )
+    title_pattern = re.compile(
+        r'<h[1-6]\b[^>]*>\s*<a\b[^>]*href=["\'](?P<href>[^"\']*session/\d+[^"\']*)["\'][^>]*>'
+        r'(?P<title>.*?)</a>\s*</h[1-6]>',
+        flags=re.I | re.S,
+    )
+    sessions: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for article in article_pattern.finditer(text):
+        match = title_pattern.search(article.group("body"))
+        if not match:
+            continue
+        session_url = urlparse(urljoin(schedule_url, html.unescape(match.group("href"))))._replace(
+            query="", fragment=""
+        ).geturl()
+        if session_url in seen:
+            continue
+        seen.add(session_url)
+        sessions.append((session_url, strip_html(match.group("title"))))
+    return sessions
+
+
+def crawl_schedule_adapter(
     conn: sqlite3.Connection,
     schedule_url: str,
-    event_name: str | None = None,
-    delay_seconds: float = 0.5,
-    limit: int | None = None,
+    event_name: str | None,
+    delay_seconds: float,
+    limit: int | None,
+    adapter_name: str,
+    discoverer: Callable[[str], list[tuple[str, str]]],
 ) -> list[str]:
     event = event_name or infer_event_name(schedule_url)
     event_id = upsert_event(conn, event, source_url=schedule_url, website_url=schedule_url)
     try:
-        discovered = discover_postgresql_eu_sessions(schedule_url)
+        discovered = discoverer(schedule_url)
     except Exception as exc:  # noqa: BLE001
         return [
-            f"ERROR postgresql.eu schedule scan failed: {exc}",
-            "discovered postgresql.eu sessions: 0",
+            f"ERROR {adapter_name} schedule scan failed: {exc}",
+            f"discovered {adapter_name} sessions: 0",
             "summary: downloaded=0, skipped=0, missing=0, failed=1",
         ]
     if limit is not None:
         discovered = discovered[:limit]
 
-    messages = [f"discovered postgresql.eu sessions: {len(discovered)}"]
+    messages = [f"discovered {adapter_name} sessions: {len(discovered)}"]
     downloaded = 0
     skipped = 0
     missing = 0
@@ -2253,6 +2328,9 @@ def crawl_postgresql_eu(
             if ok:
                 downloaded += 1
                 messages.append(f"OK {title}: {msg}")
+            elif failed_download_message(msg):
+                failed += 1
+                messages.append(f"ERROR {title}: {msg}")
             else:
                 skipped += 1
                 messages.append(f"SKIP {title}: {msg}")
@@ -2262,6 +2340,394 @@ def crawl_postgresql_eu(
     messages.append(
         f"summary: downloaded={downloaded}, skipped={skipped}, missing={missing}, failed={failed}"
     )
+    return messages
+
+
+def crawl_postgresql_eu(
+    conn: sqlite3.Connection,
+    schedule_url: str,
+    event_name: str | None = None,
+    delay_seconds: float = 0.5,
+    limit: int | None = None,
+) -> list[str]:
+    return crawl_schedule_adapter(
+        conn,
+        schedule_url,
+        event_name,
+        delay_seconds,
+        limit,
+        "postgresql.eu",
+        discover_postgresql_eu_sessions,
+    )
+
+
+def crawl_postgresql_us(
+    conn: sqlite3.Connection,
+    schedule_url: str,
+    event_name: str | None = None,
+    delay_seconds: float = 0.5,
+    limit: int | None = None,
+) -> list[str]:
+    return crawl_schedule_adapter(
+        conn,
+        schedule_url,
+        event_name,
+        delay_seconds,
+        limit,
+        "postgresql.us",
+        discover_postgresql_us_sessions,
+    )
+
+
+def postgres_resource_text(value: str) -> bool:
+    return bool(re.search(r"\bpostgres(?:ql)?\b|\bpg[_-][a-z0-9]+|\bpgconf", readable_text(value), re.I))
+
+
+def discover_duckdb_library_entries(source_url: str) -> list[dict[str, object]]:
+    text = read_url_text(source_url, timeout=15, retries=1, prefer_curl=True)
+    pattern = re.compile(
+        r'<div\b[^>]*class=["\'][^"\']*\blibrarypreview\b[^"\']*["\'][^>]*'
+        r'data-title=["\'](?P<title>[^"\']+)["\'][^>]*data-type=["\'](?P<type>[^"\']+)["\'][^>]*>'
+        r'.*?<a\b[^>]*href=["\'](?P<href>[^"\']+)["\'][^>]*class=["\'][^"\']*\bblocklink\b',
+        flags=re.I | re.S,
+    )
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(text):
+        title = readable_text(match.group("title"))
+        if match.group("type").lower() != "talk" or not postgres_resource_text(title):
+            continue
+        page_url = urljoin(source_url, html.unescape(match.group("href")))
+        if page_url in seen:
+            continue
+        seen.add(page_url)
+        entries.append({"title": title, "page_url": page_url})
+    return entries
+
+
+def discover_mydbops_entries(source_url: str) -> list[dict[str, object]]:
+    text = read_url_text(source_url, timeout=15, retries=1, prefer_curl=True)
+    pattern = re.compile(
+        r'<a\b[^>]*href=["\'](?P<href>/webinars/[^"\']+)["\'][^>]*>'
+        r'.*?<div\b[^>]*class=["\'][^"\']*\bwebninar-head\b[^"\']*["\'][^>]*>'
+        r'(?P<title>.*?)</div>',
+        flags=re.I | re.S,
+    )
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for match in pattern.finditer(text):
+        title = strip_html(match.group("title"))
+        page_url = urljoin(source_url, html.unescape(match.group("href")))
+        if page_url in seen or not postgres_resource_text(f"{title} {page_url}"):
+            continue
+        seen.add(page_url)
+        entries.append({"title": title or infer_session_title(page_url), "page_url": page_url})
+    return entries
+
+
+def discover_speakerdeck_entries(source_urls: list[str], max_pages: int = 1) -> list[dict[str, object]]:
+    pattern = re.compile(
+        r'<a\b[^>]*class=["\'][^"\']*\bdeck-preview-link\b[^"\']*["\'][^>]*'
+        r'href=["\'](?P<href>[^"\']+)["\'][^>]*title=["\'](?P<title>[^"\']+)["\']',
+        flags=re.I | re.S,
+    )
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for source_url in source_urls:
+        for page in range(1, max(1, max_pages) + 1):
+            separator = "&" if "?" in source_url else "?"
+            page_url = source_url if page == 1 else f"{source_url}{separator}page={page}"
+            text = read_url_text(page_url, timeout=15, retries=1, prefer_curl=True)
+            for match in pattern.finditer(text):
+                title = readable_text(match.group("title"))
+                deck_url = urljoin(page_url, html.unescape(match.group("href")))
+                if deck_url in seen or not postgres_resource_text(title):
+                    continue
+                seen.add(deck_url)
+                entries.append({"title": title, "page_url": deck_url})
+    return entries
+
+
+def discover_jpug_event_pages(source_url: str) -> list[tuple[str, str]]:
+    links = extract_links(source_url, timeout=15, retries=1, prefer_curl=True)
+    events: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for url, label in links:
+        parsed = urlparse(url)
+        match = re.search(r"(?:^|/)(?:jpug-)?pgcon(20\d{2})(?:/|$)", parsed.path, re.I)
+        if not match or parsed.path.rstrip("/").endswith("/en"):
+            continue
+        normalized = parsed._replace(query="", fragment="").geturl()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        name = readable_text(label) or f"PostgreSQL Conference Japan {match.group(1)}"
+        events.append((normalized, name))
+    events.sort(key=lambda item: re.search(r"20\d{2}", item[1]).group(0) if re.search(r"20\d{2}", item[1]) else "", reverse=True)
+    return events
+
+
+def jpug_cell_title(cell_html: str, fallback_url: str) -> str:
+    def clean_title(value: str) -> str:
+        value = re.sub(
+            r"^[\s\u3000]*[【\[]?[A-ZＫＴＥＢ]\d+[】\]]?[\s\u3000]*",
+            "",
+            value,
+        ).strip()
+        return re.sub(
+            r"\s*[\[\uff3b](?:講演)?(?:スライド|資料)[\]\uff3d]\s*$",
+            "",
+            value,
+        ).strip()
+
+    agenda_link = re.search(
+        r'<a\b[^>]*href=["\']#[^"\']+["\'][^>]*>(?P<title>.*?)</a>',
+        cell_html,
+        flags=re.I | re.S,
+    )
+    title = clean_title(strip_html(agenda_link.group("title"))) if agenda_link else ""
+    if not title:
+        paragraph = re.search(r"<p\b[^>]*>(?P<body>.*?)</p>", cell_html, flags=re.I | re.S)
+        title = clean_title(strip_html(paragraph.group("body") if paragraph else cell_html))
+    return title or infer_session_title(fallback_url)
+
+
+def discover_jpug_entries(event_url: str) -> list[dict[str, object]]:
+    text = read_url_text(event_url, timeout=15, retries=1, prefer_curl=True)
+    cells = re.findall(r"<td\b[^>]*>(.*?)</td>", text, flags=re.I | re.S)
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    link_pattern = re.compile(r'<a\b[^>]*href=["\'](?P<href>[^"\']+)["\'][^>]*>(?P<label>.*?)</a>', re.I | re.S)
+    for cell in cells:
+        links: list[tuple[str, str]] = []
+        for match in link_pattern.finditer(cell):
+            url = urljoin(event_url, html.unescape(match.group("href")))
+            label = strip_html(match.group("label"))
+            slide_label = bool(re.search(r"講演(?:スライド|資料)|スライド資料|slide", label, re.I))
+            if (
+                is_probably_slide_asset(url, label)
+                or urlparse(url).netloc.lower() == "speakerdeck.com"
+                or slide_label
+            ):
+                links.append((url, label))
+        if not links:
+            continue
+        record_key = links[0][0]
+        if record_key in seen:
+            continue
+        seen.add(record_key)
+        direct_assets = [item for item in links if is_probably_slide_asset(*item)]
+        asset_pages = [url for url, label in links if not is_probably_slide_asset(url, label)]
+        entries.append(
+            {
+                "title": jpug_cell_title(cell, record_key),
+                "page_url": event_url,
+                "assets": direct_assets,
+                "asset_pages": asset_pages,
+                "scan_page": False,
+            }
+        )
+    return entries
+
+
+def resource_page_assets(
+    page_url: str,
+    expected_event_url: str = "",
+) -> tuple[list[tuple[str, str]], str]:
+    if urlparse(page_url).netloc.lower() == "speakerdeck.com":
+        text = read_url_text(page_url, timeout=15, retries=1, prefer_curl=True)
+        assets: list[tuple[str, str]] = []
+        for tag in re.findall(r"<a\b[^>]*>", text, flags=re.I):
+            title_match = re.search(r'\btitle=["\']([^"\']+)["\']', tag, flags=re.I)
+            href_match = re.search(r'\bhref=["\']([^"\']+)["\']', tag, flags=re.I)
+            if not title_match or not href_match or readable_text(title_match.group(1)).lower() != "download pdf":
+                continue
+            asset_url = urljoin(page_url, html.unescape(href_match.group(1)))
+            if is_probably_slide_asset(asset_url, "Download PDF"):
+                assets.append((asset_url, "Download PDF"))
+        page_info = parse_html_page(page_url, text)
+        return assets, str(page_info["abstract"] or "")
+
+    text = read_url_text(page_url, timeout=15, retries=1, prefer_curl=True)
+    page_info = parse_html_page(page_url, text)
+    host = urlparse(page_url).netloc.lower()
+    if host.endswith("sraoss.co.jp") and expected_event_url:
+        expected = expected_event_url.rstrip("/")
+        assets: list[tuple[str, str]] = []
+        blocks = re.findall(
+            r'<div\b[^>]*class=["\'][^"\']*\bdocument_left\b[^"\']*["\'][^>]*>'
+            r'(?P<body>.*?)'
+            r'<div\b[^>]*class=["\'][^"\']*\beventline\b[^"\']*["\'][^>]*>',
+            text,
+            flags=re.I | re.S,
+        )
+        for block in blocks:
+            if expected not in html.unescape(block).replace("&amp;", "&"):
+                continue
+            block_info = parse_html_page(page_url, block)
+            assets.extend(
+                (url, label)
+                for url, label in block_info["links"]
+                if is_probably_slide_asset(url, label)
+            )
+        return assets, str(page_info["abstract"] or "")
+
+    assets = [(url, label) for url, label in page_info["links"] if is_probably_slide_asset(url, label)]
+    if len(assets) != 1:
+        assets = []
+    return assets, str(page_info["abstract"] or "")
+
+
+def crawl_publication_entries(
+    conn: sqlite3.Connection,
+    event_name: str,
+    source_url: str,
+    adapter_name: str,
+    entries: list[dict[str, object]],
+    delay_seconds: float = 0.5,
+    limit: int | None = None,
+) -> list[str]:
+    if limit is not None:
+        entries = entries[:limit]
+    event_id = upsert_event(conn, event_name, source_url=source_url, website_url=source_url)
+    messages = [f"discovered {adapter_name} entries: {len(entries)}"]
+    downloaded = skipped = missing = failed = 0
+    for entry in entries:
+        title = readable_text(str(entry.get("title") or "")) or infer_session_title(str(entry["page_url"]))
+        page_url = str(entry["page_url"])
+        session_id = upsert_session(conn, event_id, title, session_url=page_url, asset_status="missing")
+        assets = list(entry.get("assets") or [])
+        abstracts: list[str] = []
+        try:
+            for asset_page in entry.get("asset_pages") or []:
+                page_assets, abstract = resource_page_assets(str(asset_page), expected_event_url=page_url)
+                assets.extend(page_assets)
+                if abstract:
+                    abstracts.append(abstract)
+            if entry.get("scan_page", True):
+                page_assets, abstract = resource_page_assets(page_url)
+                assets.extend(page_assets)
+                if abstract:
+                    abstracts.append(abstract)
+        except HTTPError as exc:
+            status = "login_required" if exc.code in (401, 403) else "failed"
+            mark_session_checked(conn, session_id, status, message=f"http error {exc.code}", source_url=page_url)
+            failed += 1
+            messages.append(f"ERROR {title}: http error {exc.code}")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            mark_session_checked(conn, session_id, "failed", message=str(exc), source_url=page_url)
+            failed += 1
+            messages.append(f"ERROR {title}: {exc}")
+            continue
+
+        if abstracts:
+            session_id = upsert_session(
+                conn,
+                event_id,
+                title,
+                session_url=page_url,
+                asset_status="missing",
+                abstract=" ".join(abstracts),
+            )
+        unique_assets: list[tuple[str, str]] = []
+        seen_assets: set[str] = set()
+        for asset_url, label in assets:
+            normalized = normalized_asset_url(str(asset_url))
+            if normalized in seen_assets:
+                continue
+            seen_assets.add(normalized)
+            unique_assets.append((normalized, str(label)))
+        if not unique_assets:
+            mark_session_checked(conn, session_id, "missing", message="no public downloadable slides", source_url=page_url)
+            missing += 1
+            messages.append(f"WAIT {title}: no public downloadable slides")
+            continue
+        for asset_url, label in unique_assets:
+            asset_title = asset_title_from_context(title, label, asset_url, len(unique_assets))
+            ok, msg = download_asset(conn, session_id, asset_url, event_name, asset_title)
+            if ok:
+                downloaded += 1
+                messages.append(f"OK {title}: {msg}")
+            elif failed_download_message(msg):
+                failed += 1
+                messages.append(f"ERROR {title}: {msg}")
+            else:
+                skipped += 1
+                messages.append(f"SKIP {title}: {msg}")
+        if delay_seconds:
+            time.sleep(delay_seconds)
+    messages.append(f"summary: downloaded={downloaded}, skipped={skipped}, missing={missing}, failed={failed}")
+    return messages
+
+
+def harvest_jpug(
+    conn: sqlite3.Connection,
+    source_url: str,
+    delay_seconds: float,
+    limit: int | None,
+) -> list[str]:
+    messages: list[str] = []
+    remaining = limit
+    for event_url, event_name in discover_jpug_event_pages(source_url):
+        entries = discover_jpug_entries(event_url)
+        if not entries:
+            continue
+        event_limit = remaining if remaining is not None else None
+        child = crawl_publication_entries(
+            conn,
+            event_name,
+            event_url,
+            "jpug",
+            entries,
+            delay_seconds,
+            event_limit,
+        )
+        messages.append(f"event: {event_name} -> {event_url}")
+        messages.extend(f"  {line}" for line in child)
+        if remaining is not None:
+            remaining -= min(remaining, len(entries))
+            if remaining <= 0:
+                break
+    return messages or ["discovered jpug entries: 0", "summary: downloaded=0, skipped=0, missing=0, failed=0"]
+
+
+def harvest_publication_source(
+    conn: sqlite3.Connection,
+    source_name: str,
+    delay_seconds: float = 0.5,
+    limit: int | None = None,
+    max_pages: int = 1,
+) -> list[str]:
+    sources = load_json(SOURCES_PATH, {}).get("publication_sources", {})
+    source_urls = list(sources.get(source_name, []))
+    if not source_urls:
+        return [f"ERROR publication source is not configured: {source_name}"]
+    if source_name == "duckdb":
+        entries = discover_duckdb_library_entries(source_urls[0])
+        return crawl_publication_entries(conn, "DuckDB Library - PostgreSQL", source_urls[0], "duckdb", entries, delay_seconds, limit)
+    if source_name == "mydbops":
+        entries = discover_mydbops_entries(source_urls[0])
+        return crawl_publication_entries(conn, "MyDBOps PostgreSQL Webinars", source_urls[0], "mydbops", entries, delay_seconds, limit)
+    if source_name == "speakerdeck":
+        entries = discover_speakerdeck_entries(source_urls, max_pages=max_pages)
+        return crawl_publication_entries(conn, "Speaker Deck - PostgreSQL", source_urls[0], "speakerdeck", entries, delay_seconds, limit)
+    if source_name == "jpug":
+        return harvest_jpug(conn, source_urls[0], delay_seconds, limit)
+    return [f"ERROR unsupported publication source: {source_name}"]
+
+
+def harvest_all_publication_sources(
+    conn: sqlite3.Connection,
+    delay_seconds: float = 0.5,
+    limit: int | None = None,
+    max_pages: int = 1,
+) -> list[str]:
+    messages: list[str] = []
+    for source_name in ("duckdb", "mydbops", "speakerdeck", "jpug"):
+        messages.append(f"source: {source_name}")
+        child = harvest_publication_source(conn, source_name, delay_seconds, limit, max_pages)
+        messages.extend(f"  {line}" for line in child)
     return messages
 
 
@@ -2426,6 +2892,9 @@ def crawl_eventyay(
             if ok:
                 downloaded += 1
                 messages.append(f"OK {title}: {msg}")
+            elif failed_download_message(msg):
+                failed += 1
+                messages.append(f"ERROR {title}: {msg}")
             else:
                 skipped += 1
                 messages.append(f"SKIP {title}: {msg}")
@@ -2510,6 +2979,28 @@ def pgevents_sessions_url(url: str) -> str | None:
         return None
     event_slug = parts[idx + 1]
     return f"{parsed.scheme}://{parsed.netloc}/events/{event_slug}/sessions/"
+
+
+def postgresql_us_schedule_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host in {"postgresql.us", "www.postgresql.us"}:
+        match = re.match(r"^/events/([^/]+)(?:/(?:schedule|register))?/?$", parsed.path)
+        if match:
+            return f"{parsed.scheme}://postgresql.us/events/{match.group(1)}/schedule/"
+
+    try:
+        for link_url, label in extract_links(url, timeout=8, retries=1, prefer_curl=True):
+            link = urlparse(link_url)
+            text = f"{link_url} {label}".lower()
+            if link.netloc.lower() not in {"postgresql.us", "www.postgresql.us"}:
+                continue
+            if not re.search(r"/events/[^/]+/(?:schedule|register)/?", link.path) and "schedule" not in text:
+                continue
+            return postgresql_us_schedule_url(link_url)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def postgresql_eu_schedule_url(url: str) -> str | None:
@@ -2647,6 +3138,8 @@ def classify_adapter_url(url: str) -> str:
         return "indico"
     if host == "www.pgevents.ca":
         return "pgevents"
+    if host in {"postgresql.us", "www.postgresql.us"}:
+        return "postgresql-us"
     if host.endswith("postgresql.eu") or host.endswith("pgconf.eu"):
         return "postgresql-eu"
     if host == "eventyay.com":
@@ -2689,6 +3182,9 @@ def classify_event_row(row: sqlite3.Row, resolve: bool = False, probe_wordpress:
         candidate = classify_adapter_url(url)
         if candidate != "unknown" and candidate != "postgresql-official":
             return candidate, url
+        pgus_schedule_url = postgresql_us_schedule_url(url)
+        if pgus_schedule_url:
+            return "postgresql-us", pgus_schedule_url
         schedule_url = postgresql_eu_schedule_url(url)
         if schedule_url:
             return "postgresql-eu", schedule_url
@@ -2813,6 +3309,16 @@ def download_event_by_name(
             ran_adapter = True
             messages.append(f"adapter: pgevents ({label or url}) -> {sessions_url}")
             messages.extend(crawl_pgevents(conn, sessions_url, event_name, delay_seconds, limit))
+            continue
+
+        pgus_schedule_url = postgresql_us_schedule_url(url)
+        if pgus_schedule_url and pgus_schedule_url not in seen_targets:
+            seen_targets.add(pgus_schedule_url)
+            ran_adapter = True
+            messages.append(f"adapter: postgresql-us ({label or url}) -> {pgus_schedule_url}")
+            messages.extend(crawl_postgresql_us(conn, pgus_schedule_url, event_name, delay_seconds, limit))
+            continue
+        if pgus_schedule_url and pgus_schedule_url in seen_targets:
             continue
 
         pgeu_schedule_url = postgresql_eu_schedule_url(url)
@@ -2983,6 +3489,10 @@ def discover_official_events(conn: sqlite3.Connection) -> list[str]:
     configured_sources.extend(
         (source_url, postgresql_eu_event_entries, True)
         for source_url in sources.get("postgresql_eu_events", [])
+    )
+    configured_sources.extend(
+        (source_url, postgresql_us_event_entries, True)
+        for source_url in sources.get("postgresql_us_events", [])
     )
     for source_url, entry_parser, use_event_url_as_source in configured_sources:
         try:
@@ -3514,7 +4024,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser(
         "scan-official",
-        help="discover events from postgresql.org and PostgreSQL Europe event pages",
+        help="discover events from postgresql.org, PostgreSQL Europe, and PostgreSQL US",
     )
 
     analyze = sub.add_parser("analyze-events", help="classify local events by currently supported adapter type")
@@ -3532,6 +4042,18 @@ def build_parser() -> argparse.ArgumentParser:
     pgevents.add_argument("--event")
     pgevents.add_argument("--delay", type=float, default=0.5)
     pgevents.add_argument("--limit", type=int)
+
+    pgus = sub.add_parser("crawl-postgresql-us", help="crawl a postgresql.us conference schedule")
+    pgus.add_argument("schedule_url")
+    pgus.add_argument("--event")
+    pgus.add_argument("--delay", type=float, default=0.5)
+    pgus.add_argument("--limit", type=int)
+
+    publications = sub.add_parser("harvest-source", help="discover and download PostgreSQL slides from a publication source")
+    publications.add_argument("source", choices=["duckdb", "mydbops", "speakerdeck", "jpug", "all"])
+    publications.add_argument("--delay", type=float, default=0.5)
+    publications.add_argument("--limit", type=int)
+    publications.add_argument("--max-pages", type=int, default=1, help="search-result pages to scan per Speaker Deck query")
 
     generic = sub.add_parser("crawl-generic", help="crawl a generic conference website for slide assets")
     generic.add_argument("site_url")
@@ -3607,6 +4129,19 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         if args.command == "crawl-pgevents":
             messages = crawl_pgevents(conn, args.sessions_url, args.event, args.delay, args.limit)
+            finish_with_reports(conn, run_id, messages, include_run_report=True)
+            return 0
+
+        if args.command == "crawl-postgresql-us":
+            messages = crawl_postgresql_us(conn, args.schedule_url, args.event, args.delay, args.limit)
+            finish_with_reports(conn, run_id, messages, include_run_report=True)
+            return 0
+
+        if args.command == "harvest-source":
+            if args.source == "all":
+                messages = harvest_all_publication_sources(conn, args.delay, args.limit, args.max_pages)
+            else:
+                messages = harvest_publication_source(conn, args.source, args.delay, args.limit, args.max_pages)
             finish_with_reports(conn, run_id, messages, include_run_report=True)
             return 0
 

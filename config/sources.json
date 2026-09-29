@@ -7,6 +7,26 @@
     "https://www.postgresql.eu/events/",
     "https://www.postgresql.eu/events/past/"
   ],
+  "postgresql_us_events": [
+    "https://postgresql.us/events/",
+    "https://postgresql.us/events/past/"
+  ],
+  "publication_sources": {
+    "duckdb": [
+      "https://duckdb.org/library/"
+    ],
+    "mydbops": [
+      "https://www.mydbops.com/webinars"
+    ],
+    "speakerdeck": [
+      "https://speakerdeck.com/search?q=postgresql+19",
+      "https://speakerdeck.com/search?q=postgresql+18",
+      "https://speakerdeck.com/search?q=postgresql"
+    ],
+    "jpug": [
+      "https://www.postgresql.jp/index.php/con"
+    ]
+  },
   "asset_extensions": [
     ".pdf",
     ".ppt",
