@@ -107,6 +107,10 @@ class NamingTests(unittest.TestCase):
             ),
             "community",
         )
+        self.assertEqual(
+            pgppt.best_topic_slug_from_parts(["Discover your contribution-magic"]),
+            "community",
+        )
 
     def test_russian_event_uses_non_english_archive_root(self):
         self.assertEqual(
@@ -146,7 +150,7 @@ class NamingTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 pgppt.ROOT = Path(tmp)
-                pgppt.request_url = lambda url: FakeResponse(body)
+                pgppt.request_url = lambda *args, **kwargs: FakeResponse(body)
                 conn = memory_conn(self)
                 pgppt.init_db(conn)
                 pgppt.ensure_tags(conn)
@@ -197,7 +201,7 @@ class NamingTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 pgppt.ROOT = Path(tmp)
-                pgppt.request_url = lambda url: FakeResponse(body)
+                pgppt.request_url = lambda *args, **kwargs: FakeResponse(body)
                 conn = memory_conn(self)
                 pgppt.init_db(conn)
                 pgppt.ensure_tags(conn)
@@ -235,7 +239,7 @@ class NamingTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 pgppt.ROOT = Path(tmp)
 
-                def fake_request_url(url):
+                def fake_request_url(url, **kwargs):
                     seen_urls.append(url)
                     return FakeResponse(body, "application/octet-stream")
 
@@ -279,7 +283,9 @@ class NamingTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 pgppt.ROOT = Path(tmp)
-                pgppt.request_url = lambda url: FakeResponse(b"<html>not a pdf</html>", "text/html")
+                pgppt.request_url = lambda *args, **kwargs: FakeResponse(
+                    b"<html>not a pdf</html>", "text/html"
+                )
                 conn = memory_conn(self)
                 pgppt.init_db(conn)
                 pgppt.ensure_tags(conn)
@@ -514,7 +520,7 @@ class NamingTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 pgppt.ROOT = Path(tmp)
-                pgppt.request_url = lambda url: FakeResponse(body)
+                pgppt.request_url = lambda *args, **kwargs: FakeResponse(body)
                 conn = memory_conn(self)
                 pgppt.init_db(conn)
                 pgppt.ensure_tags(conn)

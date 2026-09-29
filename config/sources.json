@@ -3,6 +3,10 @@
     "https://www.postgresql.org/about/events/",
     "https://www.postgresql.org/about/eventarchive/"
   ],
+  "postgresql_eu_events": [
+    "https://www.postgresql.eu/events/",
+    "https://www.postgresql.eu/events/past/"
+  ],
   "asset_extensions": [
     ".pdf",
     ".ppt",

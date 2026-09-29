@@ -176,7 +176,7 @@ class AdapterTests(unittest.TestCase):
               <a href="https://www.youtube.com/watch?v=abc">play icon</a>
             </body></html>
             """
-            pgppt.request_url = lambda url: FakeResponse(html, "text/html")
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(html, "text/html")
 
             self.assertEqual(
                 pgppt.posette_schedule_url("https://posetteconf.com/2026/conduct/"),
@@ -192,7 +192,7 @@ class AdapterTests(unittest.TestCase):
     def test_eventyay_event_url_can_be_discovered_from_sponsorship_page(self):
         original_request_url = pgppt.request_url
         try:
-            def fake_request(url):
+            def fake_request(url, **kwargs):
                 if url == "https://summit.fossasia.org/":
                     return FakeResponse(
                         b'<meta http-equiv="refresh" content="0; url=https://eventyay.com/e/88882f3e" />',
@@ -239,7 +239,7 @@ class AdapterTests(unittest.TestCase):
                 + __import__("json").dumps(payload)
                 + "</script>"
             ).encode()
-            pgppt.request_url = lambda url: FakeResponse(html, "text/html")
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(html, "text/html")
 
             sessions = pgppt.discover_eventyay_sessions("https://eventyay.com/ev/88882f3e/")
 
@@ -318,7 +318,7 @@ class AdapterTests(unittest.TestCase):
               <a href="https://www.postgresql.eu/events/schedule/fosdem2026/">Schedule</a>
             </body></html>
             """
-            pgppt.request_url = lambda url: FakeResponse(html, "text/html")
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(html, "text/html")
 
             self.assertEqual(
                 pgppt.postgresql_eu_schedule_url("https://2026.fosdempgday.org"),
@@ -327,18 +327,126 @@ class AdapterTests(unittest.TestCase):
         finally:
             pgppt.request_url = original_request_url
 
+    def test_postgresql_eu_schedule_url_can_be_inferred_from_registration_link(self):
+        original_request_url = pgppt.request_url
+        try:
+            html = b"""
+            <html><body>
+              <a href="https://2026.pgday.nl/schedule/">Schedule</a>
+              <a href="https://www.postgresql.eu/events/pgdaynl2026/register/">Your Attendance</a>
+            </body></html>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(html, "text/html")
+
+            self.assertEqual(
+                pgppt.postgresql_eu_schedule_url("https://2026.pgday.nl/"),
+                "https://www.postgresql.eu/events/pgdaynl2026/schedule/",
+            )
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_postgresql_eu_event_entries_parse_dates_and_deduplicate(self):
+        original_request_url = pgppt.request_url
+        try:
+            html = b"""
+            <html><body>
+              <dl class="eventlist">
+                <dt><h5><a href="https://2026.pgday.nl/">PGDay Lowlands 2026</a></h5></dt>
+                <dd>
+                  <span><i class="fa fa-calendar-days"></i> 2026-09-10</span>
+                  <span>Utrecht, Netherlands</span>
+                </dd>
+                <dt><h5><a href="https://2026.pgconf.eu/">PGConf.EU 2026</a></h5></dt>
+                <dd><span>2026-10-20 - 2026-10-23</span></dd>
+              </dl>
+              <dl class="eventlist">
+                <dt><h5><a href="https://2026.pgday.nl/">PGDay Lowlands 2026</a></h5></dt>
+                <dd><span>2026-09-10</span></dd>
+              </dl>
+            </body></html>
+            """
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(html, "text/html")
+
+            entries = pgppt.postgresql_eu_event_entries("https://www.postgresql.eu/events/")
+
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(
+                entries[0],
+                {
+                    "name": "PGDay Lowlands 2026",
+                    "url": "https://2026.pgday.nl/",
+                    "start_date": "2026-09-10",
+                    "end_date": "2026-09-10",
+                },
+            )
+            self.assertEqual(entries[1]["start_date"], "2026-10-20")
+            self.assertEqual(entries[1]["end_date"], "2026-10-23")
+        finally:
+            pgppt.request_url = original_request_url
+
+    def test_scan_official_includes_postgresql_eu_sources(self):
+        original_load_json = pgppt.load_json
+        original_official_entries = pgppt.official_event_entries
+        original_eu_entries = pgppt.postgresql_eu_event_entries
+        try:
+            pgppt.load_json = lambda path, default: {
+                "official_events": ["https://www.postgresql.org/about/events/"],
+                "postgresql_eu_events": ["https://www.postgresql.eu/events/"],
+            }
+            pgppt.official_event_entries = lambda url: []
+            pgppt.postgresql_eu_event_entries = lambda url: [
+                {
+                    "name": "PGDay Lowlands 2026",
+                    "url": "https://2026.pgday.nl/",
+                    "start_date": "2026-09-10",
+                    "end_date": "2026-09-10",
+                }
+            ]
+            conn = memory_conn(self)
+            pgppt.init_db(conn)
+
+            messages = pgppt.discover_official_events(conn)
+
+            event = conn.execute(
+                "select name, start_date, end_date, website_url from events where name = ?",
+                ("PGDay Lowlands 2026",),
+            ).fetchone()
+            self.assertIsNotNone(event)
+            self.assertEqual(event["start_date"], "2026-09-10")
+            self.assertEqual(event["end_date"], "2026-09-10")
+            self.assertEqual(event["website_url"], "https://2026.pgday.nl/")
+            self.assertIn(
+                "OK https://www.postgresql.eu/events/: discovered 1 event links, dated 1",
+                messages,
+            )
+        finally:
+            pgppt.load_json = original_load_json
+            pgppt.official_event_entries = original_official_entries
+            pgppt.postgresql_eu_event_entries = original_eu_entries
+
     def test_discover_postgresql_eu_sessions(self):
         original_request_url = pgppt.request_url
         try:
             html = b"""
             <html><body>
-              <a href="session/7370-zero-downtime-upgrades-postgresql-and-osglibc-at-global-scale/">
-                Zero-Downtime Upgrades: PostgreSQL and OS/glibc at Global Scale
-              </a>
-              <a href="../../speaker/459-alexander-sosna/">Speaker</a>
+              <details class="session track-developer" id="session-7370">
+                <summary>
+                  <h4 class="session-title">
+                    Zero-Downtime Upgrades: PostgreSQL and OS/glibc at Global Scale
+                  </h4>
+                </summary>
+                <a class="icon slides"
+                   href="session/7370-zero-downtime-upgrades-postgresql-and-osglibc-at-global-scale/#slides">
+                  Slides available
+                </a>
+                <a class="button primary slim"
+                   href="session/7370-zero-downtime-upgrades-postgresql-and-osglibc-at-global-scale/">
+                  See Session Details
+                </a>
+              </details>
             </body></html>
             """
-            pgppt.request_url = lambda url: FakeResponse(html, "text/html")
+            pgppt.request_url = lambda *args, **kwargs: FakeResponse(html, "text/html")
 
             sessions = pgppt.discover_postgresql_eu_sessions("https://www.postgresql.eu/events/fosdem2026/schedule/")
 
@@ -387,7 +495,7 @@ class ReportTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 pgppt.ROOT = Path(tmp)
-                pgppt.request_url = lambda url: FakeResponse(body)
+                pgppt.request_url = lambda *args, **kwargs: FakeResponse(body)
                 conn = memory_conn(self)
                 pgppt.init_db(conn)
                 pgppt.ensure_tags(conn)
@@ -428,7 +536,7 @@ class ReportTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 pgppt.ROOT = Path(tmp)
-                pgppt.request_url = lambda url: FakeResponse(body)
+                pgppt.request_url = lambda *args, **kwargs: FakeResponse(body)
                 conn = memory_conn(self)
                 pgppt.init_db(conn)
                 pgppt.ensure_tags(conn)

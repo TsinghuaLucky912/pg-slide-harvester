@@ -63,6 +63,7 @@ published, downloading files one by one, and renaming cryptic filenames by hand.
 
 Current adapters include:
 
+- PostgreSQL Europe event discovery and schedules (`postgresql.eu` / `pgconf.eu`).
 - `pgevents.ca`, such as PGConf.dev.
 - Indico-based events, such as CERN PGDay.
 - WordPress-based conference websites.
@@ -322,6 +323,7 @@ PostgreSQL 生态会议中的公开 PPT/PDF 资料。它会从 PostgreSQL 官方
 
 ### 当前支持的来源
 
+- PostgreSQL Europe 活动发现与日程页（`postgresql.eu` / `pgconf.eu`）。
 - `pgevents.ca`，例如 PGConf.dev。
 - Indico 会议系统，例如 CERN PGDay。
 - WordPress 会议官网。
@@ -384,7 +386,7 @@ PGSH_HOME=/path/to/pg-slide-archive pgsh init
 # 初始化本地目录和 SQLite 状态
 python3 pgppt.py init
 
-# 从 PostgreSQL 官方活动页发现会议
+# 从 PostgreSQL 官方活动页和 PostgreSQL Europe 发现会议
 python3 pgppt.py scan-official
 
 # 查看已发现会议

@@ -213,6 +213,17 @@ def official_postgresql_event_url(url: str | None) -> bool:
     return parsed.netloc in {"www.postgresql.org", "postgresql.org"} and parsed.path.startswith("/about/event/")
 
 
+def event_listing_url(url: str | None) -> bool:
+    parsed = urlparse(url or "")
+    host = parsed.netloc.lower()
+    path = parsed.path.rstrip("/")
+    if host in {"www.postgresql.org", "postgresql.org"}:
+        return path in {"/about/events", "/about/eventarchive"}
+    if host.endswith("postgresql.eu") or host.endswith("pgconf.eu"):
+        return path in {"/events", "/events/past"}
+    return False
+
+
 def shallow_page_url(url: str | None) -> bool:
     parsed = urlparse(url or "")
     path = parsed.path.strip("/")
@@ -227,6 +238,8 @@ def better_event_url(existing: str | None, incoming: str | None) -> str | None:
     if not incoming:
         return existing
     if not existing:
+        return incoming
+    if event_listing_url(existing) and not event_listing_url(incoming):
         return incoming
     if non_content_event_link(existing) and not non_content_event_link(incoming):
         return incoming
@@ -977,7 +990,7 @@ def sha256_file(path: Path) -> str:
 
 def asset_content_error(path: Path, ext: str, content_type: str) -> str | None:
     lowered_type = (content_type or "").lower()
-    if any(marker in lowered_type for marker in ("text/html", "application/xhtml", "text/plain")):
+    if any(marker in lowered_type for marker in ("text/html", "application/xhtml", "text/plain", "application/json", "application/xml", "text/xml")):
         return f"unexpected asset content-type={content_type or 'unknown'}"
     with path.open("rb") as f:
         header = f.read(8)
@@ -1426,6 +1439,40 @@ def official_event_entries(source_url: str) -> list[dict[str, str | None]]:
     return entries
 
 
+def postgresql_eu_event_entries(source_url: str) -> list[dict[str, str | None]]:
+    text = read_url_text(source_url, timeout=12, retries=1, prefer_curl=True)
+    event_lists = re.findall(
+        r'<dl\b[^>]*class=["\'][^"\']*\beventlist\b[^"\']*["\'][^>]*>(.*?)</dl>',
+        text,
+        flags=re.I | re.S,
+    )
+    entry_pattern = re.compile(
+        r'<dt\b[^>]*>.*?<h[1-6]\b[^>]*>.*?'
+        r'<a\b[^>]*href=["\'](?P<href>[^"\']+)["\'][^>]*>(?P<label>.*?)</a>'
+        r'.*?</h[1-6]>.*?</dt>\s*<dd\b[^>]*>(?P<details>.*?)</dd>',
+        flags=re.I | re.S,
+    )
+    entries: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for event_list in event_lists:
+        for match in entry_pattern.finditer(event_list):
+            url = urljoin(source_url, html.unescape(match.group("href")))
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or url in seen:
+                continue
+            seen.add(url)
+            start_date, end_date = parse_official_event_date(match.group("details"))
+            entries.append(
+                {
+                    "name": strip_html(match.group("label")) or infer_session_title(url),
+                    "url": url,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                }
+            )
+    return entries
+
+
 def discover_pgevents_sessions(sessions_url: str) -> list[tuple[str, str]]:
     """Return (session_url, title) pairs from a pgevents.ca sessions listing."""
     parsed_source = urlparse(sessions_url)
@@ -1664,6 +1711,143 @@ def discover_wordpress_schedule_sessions(page: dict[str, str]) -> list[dict[str,
             }
         )
     return sessions
+
+
+def confbase_schedule_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != "confbase.io":
+        return None
+    if "/schedule" not in parsed.path:
+        return None
+    return parsed._replace(fragment="").geturl()
+
+
+def discover_confbase_schedule_urls(page_url: str) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    parsed = urlparse(page_url)
+    if parsed.netloc.lower() == "confbase.io":
+        normalized = confbase_schedule_url(page_url)
+        if normalized:
+            return [normalized]
+    try:
+        text = read_url_text(page_url, timeout=8, retries=1, prefer_curl=True)
+    except Exception:
+        return []
+    for match in re.finditer(r"https://confbase\.io/[^\"'<>\s]+/schedule(?:\?[^\"'<>\s]+)?", html.unescape(text)):
+        normalized = confbase_schedule_url(match.group(0))
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            urls.append(normalized)
+    return urls
+
+
+def confbase_presentation_asset_url(presentation_url: str) -> str:
+    if presentation_url.startswith("http://") or presentation_url.startswith("https://"):
+        return presentation_url
+    if presentation_url.startswith("/"):
+        return urljoin("https://confbase.io", presentation_url)
+    return "https://confbase.io/api/uploads/presentations/" + quote(presentation_url, safe="/")
+
+
+def discover_confbase_presentations(schedule_url: str) -> list[dict[str, str]]:
+    text = read_url_text(schedule_url, timeout=12, retries=1, prefer_curl=True)
+    presentations: list[dict[str, str]] = []
+    seen: set[str] = set()
+    base_path_match = re.search(r'\\"basePath\\":\\"(?P<base_path>(?:\\\\.|[^"\\\\])*)\\"', text)
+    base_path = json_string(base_path_match.group("base_path")) if base_path_match else schedule_url.rsplit("/schedule", 1)[0]
+    record_start_pattern = re.compile(
+        r'\\"id\\":(?P<schedule_id>\d+),\\"eventId\\":\d+,\\"day\\":\d+,'
+        r'\\"date\\":\\"(?:\\\\.|[^"\\\\])*\\",\\"startTime\\":'
+    )
+    starts = list(record_start_pattern.finditer(text))
+    for index, start_match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        chunk = text[start_match.start():end]
+        talk_id_match = re.search(r'\\"talkId\\":(?P<talk_id>\d+)', chunk)
+        if not talk_id_match:
+            continue
+        talk_prefix = rf'\\"talk\\":\{{\\"id\\":{re.escape(talk_id_match.group("talk_id"))},\\"eventId\\":\d+,'
+        if not re.search(talk_prefix, chunk):
+            continue
+        title_match = re.search(talk_prefix + r'\\"title\\":\\"(?P<title>(?:\\\\.|[^"\\\\])*)\\"', chunk)
+        asset_match = re.search(r'\\"presentationUrl\\":\\"(?P<presentation_url>(?:\\\\.|[^"\\\\])*)\\"', chunk)
+        if not title_match or not asset_match:
+            continue
+        presentation_url = json_string(asset_match.group("presentation_url")).strip()
+        if not presentation_url:
+            continue
+        talk_id = talk_id_match.group("talk_id")
+        key = f"{talk_id}:{presentation_url}"
+        if key in seen:
+            continue
+        seen.add(key)
+        abstract_match = re.search(r'\\"abstract\\":(?P<abstract>null|\\"(?:\\\\.|[^"\\\\])*\\")', chunk)
+        raw_abstract = abstract_match.group("abstract") if abstract_match else "null"
+        abstract = ""
+        if raw_abstract != "null":
+            abstract = json_string(raw_abstract[2:-2])
+        visibility_match = re.search(r'\\"slidesVisibility\\":(?P<slides_visibility>null|\\"(?:\\\\.|[^"\\\\])*\\")', chunk)
+        raw_visibility = visibility_match.group("slides_visibility") if visibility_match else "null"
+        slides_visibility = "" if raw_visibility == "null" else json_string(raw_visibility[2:-2])
+        presentations.append(
+            {
+                "title": html.unescape(json_string(title_match.group("title"))),
+                "abstract": html.unescape(abstract),
+                "session_url": f"{base_path}/schedule/{start_match.group('schedule_id')}",
+                "asset_url": confbase_presentation_asset_url(presentation_url),
+                "slides_visibility": slides_visibility,
+            }
+        )
+    return presentations
+
+
+def crawl_confbase(
+    conn: sqlite3.Connection,
+    schedule_url: str,
+    event_name: str | None = None,
+    delay_seconds: float = 0.5,
+    limit: int | None = None,
+) -> list[str]:
+    event = event_name or infer_event_name(schedule_url)
+    event_id = upsert_event(conn, event, source_url=schedule_url, website_url=schedule_url)
+    presentations = discover_confbase_presentations(schedule_url)
+    if limit is not None:
+        presentations = presentations[:limit]
+
+    messages = [f"discovered confbase presentations: {len(presentations)}"]
+    downloaded = 0
+    skipped = 0
+    failed = 0
+    for presentation in presentations:
+        title = presentation["title"]
+        session_id = upsert_session(
+            conn,
+            event_id,
+            title,
+            session_url=presentation["session_url"],
+            asset_status="missing",
+            abstract=presentation.get("abstract", ""),
+        )
+        ok, msg = download_asset(conn, session_id, presentation["asset_url"], event, title)
+        if ok:
+            downloaded += 1
+            messages.append(f"OK {title}: {msg}")
+        else:
+            row = conn.execute("select asset_status from sessions where id = ?", (session_id,)).fetchone()
+            status = row["asset_status"] if row else ""
+            if status in {"failed", "login_required"}:
+                failed += 1
+                visibility = presentation.get("slides_visibility") or "unknown"
+                messages.append(f"ERROR {title}: {msg} (slides_visibility={visibility})")
+            else:
+                skipped += 1
+                messages.append(f"SKIP {title}: {msg}")
+        if delay_seconds:
+            time.sleep(delay_seconds)
+
+    messages.append(f"summary: downloaded={downloaded}, skipped={skipped}, missing=0, failed={failed}")
+    return messages
 
 
 def crawl_wordpress(
@@ -1955,9 +2139,39 @@ def crawl_pgevents(
 def discover_postgresql_eu_sessions(schedule_url: str) -> list[tuple[str, str]]:
     """Return (session_url, title) pairs from a PostgreSQL Europe schedule page."""
     parsed_schedule = urlparse(schedule_url)
-    links = extract_links(schedule_url, timeout=8, retries=1, prefer_curl=True)
+    text = read_url_text(schedule_url, timeout=8, retries=1, prefer_curl=True)
     seen: set[str] = set()
     sessions: list[tuple[str, str]] = []
+    details_pattern = re.compile(
+        r'<details\b[^>]*class=["\'][^"\']*\bsession\b[^"\']*["\'][^>]*>(?P<body>.*?)</details>',
+        flags=re.I | re.S,
+    )
+    title_pattern = re.compile(
+        r'<h[1-6]\b[^>]*class=["\'][^"\']*\bsession-title\b[^"\']*["\'][^>]*>'
+        r'(?P<title>.*?)</h[1-6]>',
+        flags=re.I | re.S,
+    )
+    link_pattern = re.compile(
+        r'<a\b[^>]*href=["\'](?P<href>[^"\']*session/\d+[^"\']*)["\']',
+        flags=re.I | re.S,
+    )
+    for details_match in details_pattern.finditer(text):
+        body = details_match.group("body")
+        title_match = title_pattern.search(body)
+        link_match = link_pattern.search(body)
+        if not title_match or not link_match:
+            continue
+        normalized = urlparse(urljoin(schedule_url, html.unescape(link_match.group("href"))))._replace(
+            query="", fragment=""
+        ).geturl()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        sessions.append((normalized, strip_html(title_match.group("title"))))
+    if sessions:
+        return sessions
+
+    links = list(parse_html_page(schedule_url, text)["links"])
     for url, label in links:
         parsed = urlparse(url)
         if parsed.netloc != parsed_schedule.netloc:
@@ -2301,14 +2515,15 @@ def pgevents_sessions_url(url: str) -> str | None:
 def postgresql_eu_schedule_url(url: str) -> str | None:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
-    if not (host.endswith("postgresql.eu") or host.endswith("pgconf.eu")):
-        return None
-
-    old_match = re.match(r"^/events/schedule/([^/]+)/?$", parsed.path)
-    if old_match:
-        return f"{parsed.scheme}://{parsed.netloc}/events/{old_match.group(1)}/schedule/"
-    if re.match(r"^/events/[^/]+/schedule/?$", parsed.path):
-        return parsed._replace(query="", fragment="").geturl()
+    if host.endswith("postgresql.eu") or host.endswith("pgconf.eu"):
+        old_match = re.match(r"^/events/schedule/([^/]+)/?$", parsed.path)
+        if old_match:
+            return f"{parsed.scheme}://{parsed.netloc}/events/{old_match.group(1)}/schedule/"
+        if re.match(r"^/events/[^/]+/schedule/?$", parsed.path):
+            return parsed._replace(query="", fragment="").geturl()
+        event_match = re.match(r"^/events/([^/]+)/(?:register/?)?$", parsed.path)
+        if event_match:
+            return f"{parsed.scheme}://{parsed.netloc}/events/{event_match.group(1)}/schedule/"
 
     try:
         for link_url, label in extract_links(url, timeout=8, retries=1, prefer_curl=True):
@@ -2317,7 +2532,7 @@ def postgresql_eu_schedule_url(url: str) -> str | None:
             text = f"{link_url} {label}".lower()
             if not (link_host.endswith("postgresql.eu") or link_host.endswith("pgconf.eu")):
                 continue
-            if "/schedule/" not in link.path and "schedule" not in text:
+            if not re.search(r"/events/[^/]+/(?:schedule|register)/?", link.path) and "schedule" not in text:
                 continue
             return postgresql_eu_schedule_url(link_url) or link._replace(query="", fragment="").geturl()
     except Exception:  # noqa: BLE001
@@ -2630,6 +2845,17 @@ def download_event_by_name(
         if eventyay_url and eventyay_url in seen_targets:
             continue
 
+        confbase_urls = discover_confbase_schedule_urls(url)
+        if confbase_urls:
+            for confbase_url in confbase_urls:
+                if confbase_url in seen_targets:
+                    continue
+                seen_targets.add(confbase_url)
+                ran_adapter = True
+                messages.append(f"adapter: confbase ({label or url}) -> {confbase_url}")
+                messages.extend(crawl_confbase(conn, confbase_url, event_name, delay_seconds, limit))
+            continue
+
         if classify_adapter_url(url) == "wordpress" and url not in seen_targets:
             seen_targets.add(url)
             ran_adapter = True
@@ -2750,9 +2976,17 @@ def discover_official_events(conn: sqlite3.Connection) -> list[str]:
     sources = load_json(SOURCES_PATH, {})
     messages: list[str] = []
     seen: set[str] = set()
-    for source_url in sources.get("official_events", []):
+    configured_sources = [
+        (source_url, official_event_entries, False)
+        for source_url in sources.get("official_events", [])
+    ]
+    configured_sources.extend(
+        (source_url, postgresql_eu_event_entries, True)
+        for source_url in sources.get("postgresql_eu_events", [])
+    )
+    for source_url, entry_parser, use_event_url_as_source in configured_sources:
         try:
-            entries = official_event_entries(source_url)
+            entries = entry_parser(source_url)
         except Exception as exc:  # noqa: BLE001
             messages.append(f"ERROR {source_url}: {exc}")
             continue
@@ -2769,7 +3003,7 @@ def discover_official_events(conn: sqlite3.Connection) -> list[str]:
             upsert_event(
                 conn,
                 name,
-                source_url=source_url,
+                source_url=url if use_event_url_as_source else source_url,
                 website_url=url,
                 start_date=start_date,
                 end_date=end_date,
@@ -3278,7 +3512,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("init", help="initialize SQLite database and tags")
 
-    sub.add_parser("scan-official", help="discover events from postgresql.org events pages")
+    sub.add_parser(
+        "scan-official",
+        help="discover events from postgresql.org and PostgreSQL Europe event pages",
+    )
 
     analyze = sub.add_parser("analyze-events", help="classify local events by currently supported adapter type")
     analyze.add_argument("--resolve", action="store_true", help="visit official event pages and classify external websites")
